@@ -4,7 +4,11 @@
     {
       "name": "x64-release",
       "displayName": "x64 Release",
-      "architecture": "x64",
+      "generator": "Ninja",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
       "binaryDir": "${sourceDir}/out/build/x64-release",
       "condition": {
         "type": "equals",
@@ -13,22 +17,23 @@
       },
       "cacheVariables": {
         "BUILD_TESTING": true,
-        "CMAKE_CONFIGURATION_TYPES": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER_TARGET": "x86_64-pc-windows-msvc",
+        "CMAKE_LINKER": "lld-link"
       }
     }
   ],
   "buildPresets": [
     {
       "name": "x64-release",
-      "configurePreset": "x64-release",
-      "configuration": "Release"
+      "configurePreset": "x64-release"
     }
   ],
   "testPresets": [
     {
       "name": "x64-release",
       "configurePreset": "x64-release",
-      "configuration": "Release",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error" }
     }

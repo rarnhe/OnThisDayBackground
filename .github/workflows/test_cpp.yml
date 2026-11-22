@@ -32,6 +32,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Load Windows SDK and LLVM build environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -property installationPath
+          if (!$vs) { throw 'Visual Studio was not found' }
+          $arch = if ('${{ matrix.arch }}' -eq 'x64') { 'x64' } else { 'x86' }
+          Import-Module (Join-Path $vs 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+          $originalPath = $env:Path -split ';'
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=$arch -host_arch=x64"
+          $paths = @($env:Path -split ';' | Where-Object { $_ -and $_ -notin $originalPath })
+          [array]::Reverse($paths)
+          foreach ($directory in $paths) { Add-Content -LiteralPath $env:GITHUB_PATH -Value $directory }
+          foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH') {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (!$value) { throw "Developer environment did not define $name" }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value"
+          }
+          Get-Command clang-cl, lld-link, ninja | Select-Object Name, Source
+
       - name: Configure
         id: configure
         run: |
@@ -40,20 +59,20 @@ jobs:
           if ('${{ matrix.arch }}' -eq 'x64') {
             cmake --preset x64-release 2>&1 | Tee-Object out/test-logs/configure.log
           } else {
-            cmake -S . -B out/test -A ${{ matrix.arch }} -DBUILD_TESTING=ON 2>&1 | Tee-Object out/test-logs/configure.log
+            cmake -S . -B out/test -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON `
+              -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_CXX_COMPILER_TARGET=i686-pc-windows-msvc `
+              -DCMAKE_LINKER=lld-link 2>&1 | Tee-Object out/test-logs/configure.log
           }
           exit $LASTEXITCODE
 
       - name: Build
         id: build
-        env:
-          _CL_: /analyze /we28251
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           if ('${{ matrix.arch }}' -eq 'x64') {
             cmake --build --preset x64-release --parallel 2>&1 | Tee-Object out/test-logs/build.log
           } else {
-            cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log
+            cmake --build out/test --parallel 2>&1 | Tee-Object out/test-logs/build.log
           }
           exit $LASTEXITCODE
 
@@ -64,7 +83,7 @@ jobs:
           if ('${{ matrix.arch }}' -eq 'x64') {
             ctest --preset x64-release --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
           } else {
-            ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
+            ctest --test-dir out/test --output-on-failure --no-tests=error --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
           }
           exit $LASTEXITCODE
 

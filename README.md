@@ -25,7 +25,9 @@ Start-Process -FilePath .\OnThisDayBackground.exe -ArgumentList '--list "D:\Phot
 
 ## 构建与验证
 
-应用源码集中在 `OnThisDayBackground.cpp` 和 `OnThisDayBackground.h`。在 Windows 上使用 Visual Studio C++ 工具链。
+应用源码集中在 `OnThisDayBackground.cpp` 和 `OnThisDayBackground.h`。使用 Visual Studio 打开包含 `CMakeLists.txt` 的文件夹并选择 `x64-release`。预设通过 Ninja 调用 LLVM 的 `clang-cl` 和 `lld-link`，使用 Windows SDK 以及适配 Windows ABI 的 C++ 头文件和运行库。可以在 Visual Studio Installer 的「使用 C++ 的桌面开发」工作负载下添加「适用于 Windows 的 C++ Clang 工具」。
+
+在命令行构建时，从 Visual Studio 的 x64 Developer Command Prompt 或 Developer PowerShell 执行以下命令。
 
 ```powershell
 cmake --preset x64-release
@@ -33,6 +35,6 @@ cmake --build --preset x64-release --parallel
 ctest --preset x64-release
 ```
 
-x64 Release 的可执行文件在 `out/build/x64-release/Release/OnThisDayBackground.exe`。
+x64 Release 的可执行文件在 `out/build/x64-release/OnThisDayBackground.exe`。
 
 GitHub Actions 验证 x64 和 Win32，并生成 `test_report.md`。实际壁纸效果可先启动后台实例，再在单个或多个虚拟桌面下再次运行 EXE，或右键桌面空白处选择「刷新」验证。使用扩展显示器时，可在单虚拟桌面下检查副屏壁纸。切换虚拟桌面后再次运行，可检查程序是否只更新当前桌面。
