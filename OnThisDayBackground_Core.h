@@ -17,10 +17,10 @@ struct MonthDay {
 
 std::optional<MonthDay> DateInFilename(std::wstring_view stem);
 
-using ReadPhotoDate = std::function<std::optional<MonthDay>(const std::filesystem::path&)>;
+using PhotoDateReader = std::function<std::optional<MonthDay>(const std::filesystem::path&)>;
 
 std::vector<std::filesystem::path> ScanPhotos(const std::filesystem::path& folder,
-    MonthDay date, const ReadPhotoDate& readDate, std::stop_token stop = {});
+    MonthDay date, const PhotoDateReader& readDate, std::stop_token stop = {});
 
 class PhotoRotation {
 public:

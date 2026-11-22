@@ -50,7 +50,7 @@ std::optional<MonthDay> DateInFilename(std::wstring_view stem) {
 }
 
 std::vector<fs::path> ScanPhotos(const fs::path& folder, MonthDay date,
-    const ReadPhotoDate& readDate, std::stop_token stop) {
+    const PhotoDateReader& readDate, std::stop_token stop) {
     std::vector<fs::path> matches;
     std::vector<fs::path> directories{folder};
     // Walk each directory separately so a bad child cannot abort the entire scan.
