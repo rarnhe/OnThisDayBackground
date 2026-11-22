@@ -97,7 +97,7 @@ bool PhotoRotation::Advance(const std::function<bool(const fs::path&)>& display)
 namespace on_this_day {
 using Microsoft::WRL::ComPtr;
 
-std::optional<MonthDay> ReadItemDate(const std::filesystem::path& photo) {
+std::optional<MonthDay> ReadDateTaken(const std::filesystem::path& photo) {
     ComPtr<IPropertyStore> store;
     if (FAILED(SHGetPropertyStoreFromParsingName(photo.c_str(), nullptr, GPS_DEFAULT,
             IID_PPV_ARGS(store.GetAddressOf())))) {
@@ -106,7 +106,7 @@ std::optional<MonthDay> ReadItemDate(const std::filesystem::path& photo) {
 
     PROPVARIANT value{};
     SYSTEMTIME utc{}, local{};
-    const bool valid = SUCCEEDED(store->GetValue(PKEY_ItemDate, &value)) &&
+    const bool valid = SUCCEEDED(store->GetValue(PKEY_Photo_DateTaken, &value)) &&
         value.vt == VT_FILETIME && (value.filetime.dwLowDateTime || value.filetime.dwHighDateTime) &&
         FileTimeToSystemTime(&value.filetime, &utc) &&
         SystemTimeToTzSpecificLocalTimeEx(nullptr, &utc, &local);
@@ -407,12 +407,52 @@ CalendarDate Today() {
     return {time.wYear, {time.wMonth, time.wDay}};
 }
 
+HANDLE OpenCommandLineOutput() {
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (GetConsoleMode(output, &mode)) return output;
+    const DWORD type = GetFileType(output);
+    if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) return output;
+    // A GUI executable can share an existing console without creating a new one.
+    return AttachConsole(ATTACH_PARENT_PROCESS) ? GetStdHandle(STD_OUTPUT_HANDLE) : nullptr;
+}
+
+bool WriteOutput(HANDLE output, const std::wstring& text) {
+    if (!output || output == INVALID_HANDLE_VALUE) return false;
+    const auto length = static_cast<DWORD>(text.size());
+    DWORD mode = 0, written = 0;
+    if (GetConsoleMode(output, &mode)) {
+        return WriteConsoleW(output, text.data(), length, &written, nullptr) && written == length;
+    }
+    const int utf8Size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(length),
+        nullptr, 0, nullptr, nullptr);
+    if (utf8Size <= 0) return false;
+    std::string utf8(utf8Size, '\0');
+    if (!WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(length),
+            utf8.data(), utf8Size, nullptr, nullptr)) return false;
+    return WriteFile(output, utf8.data(), static_cast<DWORD>(utf8Size), &written, nullptr) &&
+        written == static_cast<DWORD>(utf8Size);
+}
+
+bool PrintMatches(HANDLE output, CalendarDate date, const std::vector<fs::path>& photos,
+    std::stop_token stop = {}) {
+    wchar_t day[16]{};
+    swprintf_s(day, L"%02u-%02u", date.monthDay.month, date.monthDay.day);
+    if (!WriteOutput(output, L"System.Photo.DateTaken " + std::wstring(day) + L": " +
+            std::to_wstring(photos.size()) + L" matching photo(s)\r\n")) return false;
+    for (const auto& photo : photos) {
+        if (stop.stop_requested() || !WriteOutput(output, photo.native() + L"\r\n")) return false;
+    }
+    return true;
+}
+
 struct Controller {
-    Controller(HINSTANCE instance, fs::path directory) :
-        folder(std::move(directory)), background(instance) {}
+    Controller(HINSTANCE instance, fs::path directory, HANDLE commandLineOutput) :
+        folder(std::move(directory)), background(instance), output(commandLineOutput) {}
 
     fs::path folder;
     DesktopBackground background;
+    HANDLE output;
     HWND window = nullptr;
     NOTIFYICONDATAW tray{};
     UINT taskbarCreated = 0;
@@ -460,7 +500,10 @@ bool BeginScan(Controller& state, CalendarDate date) {
             std::vector<fs::path> result;
             if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
                 try {
-                    result = ScanPhotos(state.folder, date.monthDay, ReadItemDate, stop);
+                    result = ScanPhotos(state.folder, date.monthDay, ReadDateTaken, stop);
+                    if (state.output && !stop.stop_requested()) {
+                        PrintMatches(state.output, date, result, stop);
+                    }
                 } catch (const std::exception& error) {
                     OutputDebugStringA(error.what());
                 }
@@ -585,30 +628,25 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
     }
 }
 
-int Run(HINSTANCE instance) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    int argc = 0;
-    const std::unique_ptr<wchar_t*, decltype(&LocalFree)> argv(
-        CommandLineToArgvW(GetCommandLineW(), &argc), &LocalFree);
-    std::error_code error;
-    fs::path folder;
-    if (argv && argc == 1) {
+fs::path ResolveFolder(const wchar_t* argument) {
+    if (!argument) {
         PWSTR pictures = nullptr;
         const HRESULT result = SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_DONT_VERIFY,
             nullptr, &pictures);
         const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> path(pictures, &CoTaskMemFree);
-        if (SUCCEEDED(result) && path) folder = path.get();
-    } else if (argv && argc == 2) {
-        folder = fs::absolute(argv.get()[1], error);
-        if (!error && !fs::is_directory(folder, error)) folder.clear();
-    }
-    if (error || folder.empty()) {
-        MessageBoxW(nullptr, L"Open the app to use your Pictures folder, or specify a valid photo folder.",
-            L"OnThisDayBackground", MB_OK | MB_ICONERROR);
-        return 1;
+        if (SUCCEEDED(result) && path) return path.get();
+        return {};
     }
 
-    Controller state{instance, std::move(folder)};
+    std::error_code error;
+    const auto folder = fs::absolute(argument, error);
+    if (!error && fs::is_directory(folder, error)) return folder;
+    return {};
+}
+
+int Run(HINSTANCE instance, fs::path folder, HANDLE output) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    Controller state{instance, std::move(folder), output};
     state.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSW windowClass{};
     windowClass.hInstance = instance;
@@ -640,7 +678,7 @@ int Run(HINSTANCE instance) {
     return result;
 }
 
-int RunSingleInstance(HINSTANCE instance) {
+int RunSingleInstance(HINSTANCE instance, fs::path folder, HANDLE output) {
     HANDLE rawMutex = CreateMutexW(nullptr, TRUE, kMutexName);
     const DWORD status = GetLastError();
     const std::unique_ptr<void, decltype(&CloseHandle)> mutex(rawMutex, &CloseHandle);
@@ -663,16 +701,49 @@ int RunSingleInstance(HINSTANCE instance) {
 
     int result = 1;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-        result = Run(instance);
+        result = Run(instance, std::move(folder), output);
         CoUninitialize();
     }
     ReleaseMutex(mutex.get());
     return result;
 }
+int ListPhotos(const fs::path& folder, HANDLE output) {
+    if (!output || FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
+    int status = 1;
+    try {
+        const auto date = Today();
+        const auto photos = ScanPhotos(folder, date.monthDay, ReadDateTaken);
+        status = PrintMatches(output, date, photos) ? 0 : 1;
+    } catch (const std::exception&) {
+        WriteOutput(output, L"Could not scan the photo folder.\r\n");
+    }
+    CoUninitialize();
+    return status;
+}
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
-    return RunSingleInstance(instance);
+    int argc = 0;
+    const std::unique_ptr<wchar_t*, decltype(&LocalFree)> argv(
+        CommandLineToArgvW(GetCommandLineW(), &argc), &LocalFree);
+    if (!argv) return 1;
+
+    const HANDLE output = OpenCommandLineOutput();
+    const bool list = argc > 1 && std::wstring_view(argv.get()[1]) == L"--list";
+    const int folderIndex = list ? 2 : 1;
+    if (argc <= folderIndex + 1) {
+        auto folder = ResolveFolder(argc > folderIndex ? argv.get()[folderIndex] : nullptr);
+        if (!folder.empty()) {
+            if (list) return ListPhotos(folder, output);
+            return RunSingleInstance(instance, std::move(folder), output);
+        }
+    }
+
+    constexpr auto usage = L"Usage: OnThisDayBackground.exe [--list] [photo folder]";
+    if (!WriteOutput(output, std::wstring(usage) + L"\r\n") && !list) {
+        MessageBoxW(nullptr, usage, L"OnThisDayBackground", MB_OK | MB_ICONERROR);
+    }
+    return 1;
 }
 
 #endif // _WIN32

@@ -2,8 +2,11 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <memory>
 #include <objbase.h>
 #include <shellapi.h>
 #include <string_view>
@@ -26,17 +29,17 @@ bool TestPhotoDecoder(const fs::path& folder) {
     const bool passed = bitmap &&
         GetObjectW(bitmap, sizeof(info), &info) && info.bmWidth == 2 && info.bmHeight == 1;
     if (bitmap) DeleteObject(bitmap);
-    return passed && !LoadPhoto(folder / "missing.bmp");
+    return passed && !ReadDateTaken(photo) && !LoadPhoto(folder / "missing.bmp");
 }
 
-bool TestItemDate(const fs::path& fixture, const fs::path& folder) {
+bool TestDateTaken(const fs::path& fixture, const fs::path& folder) {
     const auto photo = folder / fixture.filename();
     fs::copy_file(fixture, photo, fs::copy_options::overwrite_existing);
-    const MonthDay itemDate{10, 7};
-    return ReadItemDate(photo) == itemDate &&
-        ScanPhotos(folder, itemDate, ReadItemDate) == std::vector{photo} &&
-        ScanPhotos(folder, {8, 10}, ReadItemDate).empty() &&
-        !ReadItemDate(folder / "missing-2015-10-07.jpg");
+    const MonthDay dateTaken{10, 7};
+    return ReadDateTaken(photo) == dateTaken &&
+        ScanPhotos(folder, dateTaken, ReadDateTaken) == std::vector{photo} &&
+        ScanPhotos(folder, {8, 10}, ReadDateTaken).empty() &&
+        !ReadDateTaken(folder / "missing-2015-10-07.jpg");
 }
 
 bool IsWindowsGui(const fs::path& program) {
@@ -61,13 +64,20 @@ bool IsWindowsGui(const fs::path& program) {
         subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI;
 }
 
-bool Launch(const fs::path& program, const fs::path& folder, PROCESS_INFORMATION& process) {
+bool Launch(const fs::path& program, const fs::path& folder, PROCESS_INFORMATION& process,
+    bool list = false, HANDLE output = nullptr) {
     std::wstring command = L"\"" + program.wstring() + L"\"";
+    if (list) command += L" --list";
     if (!folder.empty()) command += L" \"" + folder.wstring() + L"\"";
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
-    if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
-            nullptr, &startup, &process)) return false;
+    if (output) {
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdOutput = output;
+        startup.hStdError = output;
+    }
+    if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, output != nullptr, 0,
+            nullptr, nullptr, &startup, &process)) return false;
     CloseHandle(process.hThread);
     return true;
 }
@@ -76,6 +86,51 @@ bool ExitedSuccessfully(HANDLE process, DWORD timeout) {
     DWORD code = 1;
     return WaitForSingleObject(process, timeout) == WAIT_OBJECT_0 &&
         GetExitCodeProcess(process, &code) && code == 0;
+}
+
+bool TestList(const fs::path& app, const fs::path& fixture, const fs::path& folder) {
+    std::ifstream jpeg(fixture, std::ios::binary);
+    std::string bytes{std::istreambuf_iterator<char>(jpeg), {}};
+    constexpr std::string_view original = "2015:10:07 12:00:00";
+    SYSTEMTIME local{};
+    GetLocalTime(&local);
+    char today[20]{};
+    sprintf_s(today, "%04u:%02u:%02u 12:00:00", static_cast<unsigned>(local.wYear),
+        static_cast<unsigned>(local.wMonth), static_cast<unsigned>(local.wDay));
+    auto tag = bytes.find(original);
+    if (tag == std::string::npos) return false;
+    while (tag != std::string::npos) {
+        bytes.replace(tag, original.size(), today);
+        tag = bytes.find(original, tag + original.size());
+    }
+
+    const auto photos = folder / L"photos";
+    fs::create_directory(photos);
+    const auto first = photos / L"a-\u7167\u7247.jpg";
+    const auto second = photos / L"z.jpg";
+    for (const auto& photo : {second, first}) {
+        if (!std::ofstream(photo, std::ios::binary).write(bytes.data(), bytes.size())) return false;
+    }
+
+    const auto log = folder / "stdout.txt";
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    const HANDLE raw = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &attributes,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (raw == INVALID_HANDLE_VALUE) return false;
+    std::unique_ptr<void, decltype(&CloseHandle)> output(raw, &CloseHandle);
+    PROCESS_INFORMATION process{};
+    if (!Launch(app, photos, process, true, output.get())) return false;
+    const bool exited = ExitedSuccessfully(process.hProcess, 5000);
+    if (!exited) TerminateProcess(process.hProcess, 1);
+    CloseHandle(process.hProcess);
+    output.reset();
+
+    std::ifstream result(log, std::ios::binary);
+    const std::string printed{std::istreambuf_iterator<char>(result), {}};
+    const auto expected = first.u8string() + u8"\r\n" + second.u8string() + u8"\r\n";
+    const std::string paths(expected.begin(), expected.end());
+    return exited && printed.starts_with("System.Photo.DateTaken ") &&
+        printed.ends_with("2 matching photo(s)\r\n" + paths);
 }
 
 bool TestGui(const fs::path& app, const fs::path& folder) {
@@ -123,9 +178,11 @@ int main(int argc, char**) {
     auto argv = CommandLineToArgvW(GetCommandLineW(), &count);
     if (argv && count == 3 && std::wstring_view(argv[1]) == L"--gui") {
         passed = TestGui(argv[2], folder);
+    } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {
+        passed = TestList(argv[2], argv[3], folder);
     } else if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-        if (argv && count == 3 && std::wstring_view(argv[1]) == L"--item-date") {
-            passed = TestItemDate(argv[2], folder);
+        if (argv && count == 3 && std::wstring_view(argv[1]) == L"--date-taken") {
+            passed = TestDateTaken(argv[2], folder);
         } else if (argc == 1) {
             passed = TestPhotoDecoder(folder);
         }

@@ -37,7 +37,7 @@ private:
 
 namespace on_this_day {
 
-std::optional<MonthDay> ReadItemDate(const std::filesystem::path& photo);
+std::optional<MonthDay> ReadDateTaken(const std::filesystem::path& photo);
 HBITMAP LoadPhoto(const std::filesystem::path& photo);
 std::optional<std::wstring> CurrentVirtualDesktop();
 bool DesktopHasFocus();
