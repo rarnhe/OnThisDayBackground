@@ -149,6 +149,19 @@ bool TestDesktopInterfaceFamilies() {
         DesktopInterfaceForBuild(28000) == DesktopInterface::windows11Modern;
 }
 
+bool TestCurrentDesktopGuid() {
+    const GUID first{1, 2, 3, {4, 5, 6, 7, 8, 9, 10, 11}};
+    const GUID second{2, 2, 3, {4, 5, 6, 7, 8, 9, 10, 11}};
+    const GUID removed{3, 2, 3, {4, 5, 6, 7, 8, 9, 10, 11}};
+    const std::vector list{first, second};
+    return IsCurrentDesktopGuid(second, second, list) &&
+        IsCurrentDesktopGuid(second, std::nullopt, list) &&
+        !IsCurrentDesktopGuid(second, first, list) &&
+        !IsCurrentDesktopGuid(removed, removed, list) &&
+        !IsCurrentDesktopGuid(GUID_NULL, std::nullopt, {GUID_NULL, first}) &&
+        !IsCurrentDesktopGuid(second, second, {first, second, second});
+}
+
 int main() {
     const auto folder = fs::temp_directory_path() /
         (L"on-this-day Windows test " + std::to_wstring(GetCurrentProcessId()));
@@ -158,6 +171,8 @@ int main() {
     auto argv = CommandLineToArgvW(GetCommandLineW(), &count);
     if (argv && count == 2 && std::wstring_view(argv[1]) == L"--desktop-interfaces") {
         passed = TestDesktopInterfaceFamilies();
+    } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--desktop-guid") {
+        passed = TestCurrentDesktopGuid();
     } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--one-shot") {
         passed = TestOneShot(argv[2], folder);
     } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {

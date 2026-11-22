@@ -102,6 +102,12 @@ DesktopInterface DesktopInterfaceForBuild(unsigned long build) {
     return DesktopInterface::unavailable;
 }
 
+bool IsCurrentDesktopGuid(const GUID& shell, const std::optional<GUID>& registered,
+    const std::vector<GUID>& desktops) {
+    return !IsEqualGUID(shell, GUID_NULL) && (!registered || IsEqualGUID(shell, *registered)) &&
+        std::ranges::count_if(desktops, [&](const GUID& id) { return IsEqualGUID(shell, id); }) == 1;
+}
+
 std::optional<MonthDay> ReadDateTaken(const std::filesystem::path& photo) {
     ComPtr<IPropertyStore> store;
     if (FAILED(SHGetPropertyStoreFromParsingName(photo.c_str(), nullptr, GPS_DEFAULT,
@@ -187,7 +193,7 @@ fs::path ResolveFolder(const wchar_t* argument) {
 
     std::error_code error;
     const auto folder = fs::absolute(argument, error);
-    if (!error && fs::is_directory(folder, error)) return folder;
+    if (!error && fs::is_directory(folder, error)) return folder.lexically_normal();
     return {};
 }
 
@@ -210,14 +216,35 @@ constexpr GUID kManager22H2{0xA3175F2D, 0x239C, 0x4BD2,
 constexpr GUID kManager21H2{0xB2F925B9, 0x5A0F, 0x4D2E,
     {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}};
 
+constexpr GUID kDesktopIdentity{0x3F07F4BE, 0xB107, 0x441A,
+    {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}};
+constexpr GUID kDesktopIdentity21H2{0x536D3495, 0xB208, 0x4CC9,
+    {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}};
+
+struct DesktopIdentity : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE IsViewVisible() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetId(GUID*) = 0;
+};
+
+struct DesktopWithWallpaper : DesktopIdentity {
+    virtual HRESULT STDMETHODCALLTYPE GetName() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetWallpaperPath(HSTRING*) = 0;
+};
+
+struct DesktopWithWallpaper21H2 : DesktopIdentity {
+    virtual HRESULT STDMETHODCALLTYPE IsRemote() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetName() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetWallpaperPath(HSTRING*) = 0;
+};
+
 // Explorer's private ABI changes across releases. Unused declarations preserve
 // the slots before SetDesktopWallpaper and are never called.
 struct DesktopManager : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetCount(UINT*) = 0;
     virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops() = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(IUnknown**) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetDesktops() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(DesktopIdentity**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArray**) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE SwitchDesktop() = 0;
 };
@@ -228,8 +255,8 @@ struct DesktopManager21H2 : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetCount(HMONITOR, UINT*) = 0;
     virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops() = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(HMONITOR, IUnknown**) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetDesktops() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(HMONITOR, DesktopIdentity**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDesktops(HMONITOR, IObjectArray**) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE SwitchDesktop() = 0;
 };
@@ -243,15 +270,16 @@ struct DesktopWallpaperManager : Base {
     virtual HRESULT STDMETHODCALLTYPE CreateDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE MoveDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE RemoveDesktop() = 0;
-    virtual HRESULT STDMETHODCALLTYPE FindDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindDesktop(const GUID*, DesktopIdentity**) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetDesktopSwitchIncludeExcludeViews() = 0;
     virtual HRESULT STDMETHODCALLTYPE SetDesktopName() = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetDesktopWallpaper(IUnknown*, HSTRING) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDesktopWallpaper(DesktopIdentity*, HSTRING) = 0;
 };
 
 struct ApplyResult {
     HRESULT status;
     const wchar_t* operation;
+    bool stop = false;
 };
 
 using ApplyWallpaper = std::function<ApplyResult(const fs::path&)>;
@@ -266,9 +294,51 @@ DWORD WindowsBuild() {
     return query && query(&info) == 0 ? info.dwBuildNumber : 0;
 }
 
+std::optional<GUID> RegisteredCurrentDesktop() {
+    const auto read = [](const wchar_t* key) -> std::optional<GUID> {
+        GUID id{};
+        DWORD bytes = sizeof(id);
+        if (RegGetValueW(HKEY_CURRENT_USER, key, L"CurrentVirtualDesktop", RRF_RT_REG_BINARY,
+                nullptr, &id, &bytes) == ERROR_SUCCESS && bytes == sizeof(id) &&
+            !IsEqualGUID(id, GUID_NULL)) return id;
+        return std::nullopt;
+    };
+    if (const auto current = read(kDesktopKey)) return current;
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session)) return std::nullopt;
+    const auto key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\" +
+        std::to_wstring(session) + L"\\VirtualDesktops";
+    return read(key.c_str());
+}
+
+template<class Base>
+HRESULT CurrentDesktopId(DesktopWallpaperManager<Base>& manager, GUID& id) {
+    ComPtr<DesktopIdentity> current;
+    HRESULT status;
+    if constexpr (std::is_same_v<Base, DesktopManager21H2>) {
+        status = manager.GetCurrentDesktop(nullptr, current.GetAddressOf());
+    } else {
+        status = manager.GetCurrentDesktop(current.GetAddressOf());
+    }
+    if (FAILED(status)) return status;
+    return current ? current->GetId(&id) : E_UNEXPECTED;
+}
+
+template<class Desktop>
+HRESULT ReadDesktopWallpaper(Desktop& desktop, std::wstring& value) {
+    HSTRING path = nullptr;
+    const HRESULT status = desktop.GetWallpaperPath(&path);
+    if (SUCCEEDED(status)) value = WindowsGetStringRawBuffer(path, nullptr);
+    WindowsDeleteString(path);
+    return status;
+}
+
 template<class Base>
 HRESULT GetVirtualDesktopWallpaper(IServiceProvider& shell, REFIID iid, std::optional<DWORD> registeredCount,
-    UINT& count, ApplyWallpaper& apply, const wchar_t*& operation) {
+    UINT& count, ApplyWallpaper& apply, const wchar_t*& operation, GUID& targetId) {
+    constexpr bool initial = std::is_same_v<Base, DesktopManager21H2>;
+    using Desktop = std::conditional_t<initial, DesktopWithWallpaper21H2, DesktopWithWallpaper>;
+    const auto& desktopIid = initial ? kDesktopIdentity21H2 : kDesktopIdentity;
     ComPtr<DesktopWallpaperManager<Base>> manager;
     operation = kQueryServiceOperation;
     HRESULT status = shell.QueryService(kDesktopManagerService, iid,
@@ -276,44 +346,107 @@ HRESULT GetVirtualDesktopWallpaper(IServiceProvider& shell, REFIID iid, std::opt
     if (FAILED(status)) return status;
     if (!manager) return E_UNEXPECTED;
 
-    operation = L"GetCount";
-    if constexpr (std::is_same_v<Base, DesktopManager21H2>) {
-        status = manager->GetCount(nullptr, &count);
+    ComPtr<IObjectArray> desktops;
+    operation = L"GetDesktops";
+    if constexpr (initial) {
+        status = manager->GetDesktops(nullptr, desktops.GetAddressOf());
     } else {
-        status = manager->GetCount(&count);
-    }
-    if (FAILED(status)) {
-        const bool countUnsupported = status == E_NOTIMPL || status == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-        if (!countUnsupported || !registeredCount || *registeredCount <= 1) return status;
-        count = *registeredCount;
-    }
-    if (count == 1) return S_OK;
-    if (count == 0) return E_UNEXPECTED;
-
-    ComPtr<IUnknown> desktop;
-    operation = L"GetCurrentDesktop";
-    if constexpr (std::is_same_v<Base, DesktopManager21H2>) {
-        status = manager->GetCurrentDesktop(nullptr, desktop.GetAddressOf());
-    } else {
-        status = manager->GetCurrentDesktop(desktop.GetAddressOf());
+        status = manager->GetDesktops(desktops.GetAddressOf());
     }
     if (FAILED(status)) return status;
-    if (!desktop) return E_UNEXPECTED;
+    if (!desktops) return E_UNEXPECTED;
+    status = desktops->GetCount(&count);
+    if (FAILED(status)) return status;
+    if (count == 0) return E_UNEXPECTED;
+    if (count == 1) {
+        return registeredCount && *registeredCount > 1 ? HRESULT_FROM_WIN32(ERROR_RETRY) : S_OK;
+    }
 
-    apply = [manager, desktop](const fs::path& photo) -> ApplyResult {
+    std::vector<GUID> ids;
+    std::vector<ComPtr<Desktop>> entries;
+    for (UINT index = 0; index < count; ++index) {
+        operation = L"GetDesktops/GetId";
+        ComPtr<Desktop> item;
+        status = desktops->GetAt(index, desktopIid, reinterpret_cast<void**>(item.GetAddressOf()));
+        if (FAILED(status)) return status;
+        if (!item) return E_UNEXPECTED;
+        GUID id{};
+        status = item->GetId(&id);
+        if (FAILED(status)) return status;
+        ids.push_back(id);
+        entries.push_back(std::move(item));
+    }
+
+    operation = L"GetCurrentDesktop/GetId";
+    GUID current{};
+    status = CurrentDesktopId(*manager.Get(), current);
+    if (FAILED(status)) return status;
+    if (!IsCurrentDesktopGuid(current, RegisteredCurrentDesktop(), ids)) {
+        return HRESULT_FROM_WIN32(ERROR_RETRY);
+    }
+
+    operation = L"FindDesktop by GUID";
+    ComPtr<DesktopIdentity> target;
+    status = manager->FindDesktop(&current, target.GetAddressOf());
+    if (FAILED(status)) return status;
+    if (!target) return E_UNEXPECTED;
+    GUID resolved{};
+    status = target->GetId(&resolved);
+    if (FAILED(status)) return status;
+    if (!IsEqualGUID(resolved, current)) return E_UNEXPECTED;
+
+    // A Shell-wide side effect must not be counted as a successful rotation.
+    const auto targetIndex = static_cast<std::size_t>(std::ranges::find_if(ids, [&](const GUID& id) {
+        return IsEqualGUID(id, current);
+    }) - ids.begin());
+    apply = [manager, target, current, targetIndex, entries = std::move(entries)](const fs::path& photo)
+        -> ApplyResult {
+        std::vector<std::wstring> before(entries.size());
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (i == targetIndex) continue;
+            const HRESULT snapshot = ReadDesktopWallpaper(*entries[i].Get(), before[i]);
+            if (FAILED(snapshot)) return {snapshot, L"Read other desktop wallpaper", true};
+        }
+
+        GUID active{};
+        const auto now = CurrentDesktopId(*manager.Get(), active);
+        const auto registered = RegisteredCurrentDesktop();
+        if (FAILED(now) || !IsEqualGUID(active, current) ||
+            (registered && !IsEqualGUID(*registered, current))) {
+            return {FAILED(now) ? now : HRESULT_FROM_WIN32(ERROR_RETRY), L"Recheck current desktop GUID", true};
+        }
+
         HSTRING path = nullptr;
         const HRESULT created = WindowsCreateString(photo.c_str(),
             static_cast<UINT32>(photo.native().size()), &path);
         if (FAILED(created)) return {created, L"WindowsCreateString"};
-        const HRESULT result = manager->SetDesktopWallpaper(desktop.Get(), path);
+        const HRESULT result = manager->SetDesktopWallpaper(target.Get(), path);
         WindowsDeleteString(path);
+
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (i == targetIndex) continue;
+            std::wstring after;
+            const HRESULT checked = ReadDesktopWallpaper(*entries[i].Get(), after);
+            if (FAILED(checked)) return {checked, L"Verify other desktop wallpaper", true};
+            if (after != before[i]) {
+                return {E_UNEXPECTED, L"Explorer changed another desktop's wallpaper", true};
+            }
+        }
+        if (FAILED(result)) return {result, L"SetDesktopWallpaper"};
+        std::wstring applied;
+        const HRESULT checked = ReadDesktopWallpaper(*entries[targetIndex].Get(), applied);
+        if (FAILED(checked)) return {checked, L"Verify target desktop wallpaper", true};
+        if (CompareStringOrdinal(applied.c_str(), -1, photo.c_str(), -1, TRUE) != CSTR_EQUAL) {
+            return {E_UNEXPECTED, L"Target desktop did not retain the requested wallpaper", true};
+        }
         return {result, L"SetDesktopWallpaper"};
     };
+    targetId = current;
     return S_OK;
 }
 
 HRESULT GetDesktopConfiguration(DWORD build, std::optional<DWORD> registeredCount,
-    UINT& count, ApplyWallpaper& apply, const wchar_t*& operation) {
+    UINT& count, ApplyWallpaper& apply, const wchar_t*& operation, GUID& targetId) {
     const auto family = DesktopInterfaceForBuild(build);
     if (family == DesktopInterface::unavailable) {
         operation = L"Select virtual desktop interface";
@@ -330,34 +463,43 @@ HRESULT GetDesktopConfiguration(DWORD build, std::optional<DWORD> registeredCoun
         // New builds can reuse this ABI. Require the matching IID and working
         // read-only operations before taking the wallpaper setter path.
         return GetVirtualDesktopWallpaper<DesktopManager24H2>(*shell.Get(),
-            kManager24H2, registeredCount, count, apply, operation);
+            kManager24H2, registeredCount, count, apply, operation, targetId);
     }
     if (family == DesktopInterface::windows11Initial) {
         return GetVirtualDesktopWallpaper<DesktopManager21H2>(*shell.Get(),
-            kManager21H2, registeredCount, count, apply, operation);
+            kManager21H2, registeredCount, count, apply, operation, targetId);
     }
 
     HRESULT result = GetVirtualDesktopWallpaper<DesktopManager>(*shell.Get(),
-        kManager23H2, registeredCount, count, apply, operation);
+        kManager23H2, registeredCount, count, apply, operation, targetId);
     if (result == E_NOINTERFACE && operation == kQueryServiceOperation) {
         result = GetVirtualDesktopWallpaper<DesktopManager>(*shell.Get(),
-            kManager22H2, registeredCount, count, apply, operation);
+            kManager22H2, registeredCount, count, apply, operation, targetId);
     }
     if (result == E_NOINTERFACE && operation == kQueryServiceOperation) {
         // Updated 23H2 also used this IID, before the extra 24H2 slot was added.
         result = GetVirtualDesktopWallpaper<DesktopManager>(*shell.Get(),
-            kManager24H2, registeredCount, count, apply, operation);
+            kManager24H2, registeredCount, count, apply, operation, targetId);
     }
     return result;
 }
 
 std::optional<DWORD> RegisteredDesktopCount() {
-    DWORD bytes = 0;
-    const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, kDesktopKey, L"VirtualDesktopIDs",
-        RRF_RT_REG_BINARY, nullptr, nullptr, &bytes);
-    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) return 1;
-    if (status != ERROR_SUCCESS || bytes % sizeof(GUID) != 0) return std::nullopt;
-    return std::max(1UL, static_cast<DWORD>(bytes / sizeof(GUID)));
+    const auto read = [](const wchar_t* key) -> std::optional<DWORD> {
+        DWORD bytes = 0;
+        const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, key, L"VirtualDesktopIDs",
+            RRF_RT_REG_BINARY, nullptr, nullptr, &bytes);
+        if (status != ERROR_SUCCESS || bytes == 0 || bytes % sizeof(GUID) != 0) return std::nullopt;
+        return static_cast<DWORD>(bytes / sizeof(GUID));
+    };
+    const auto global = read(kDesktopKey);
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session)) return global;
+    const auto key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\" +
+        std::to_wstring(session) + L"\\VirtualDesktops";
+    const auto local = read(key.c_str());
+    if (global && local) return std::max(*global, *local);
+    return global ? global : local;
 }
 
 HRESULT GetPrimaryMonitorWallpaper(ApplyWallpaper& apply) {
@@ -439,9 +581,13 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
     const DWORD build = WindowsBuild();
     const wchar_t* operation = L"";
     const auto registeredDesktops = RegisteredDesktopCount();
-    const HRESULT desktopStatus = GetDesktopConfiguration(build, registeredDesktops, desktops, apply, operation);
+    GUID targetId{};
+    const HRESULT desktopStatus = GetDesktopConfiguration(
+        build, registeredDesktops, desktops, apply, operation, targetId);
     const bool multipleDesktops = desktops > 1 || (registeredDesktops && *registeredDesktops > 1);
-    if (!apply && (multipleDesktops || (desktops == 0 && !registeredDesktops))) {
+    const bool unknownScope = desktops == 0 && !registeredDesktops &&
+        (build == 0 || build >= 22000);
+    if (!apply && (multipleDesktops || unknownScope)) {
         return ReportFailure(output, L"Cannot target the current virtual desktop. Windows build " +
             std::to_wstring(build) + L", " + operation + L" (" +
             DescribeError(FAILED(desktopStatus) ? desktopStatus : E_UNEXPECTED) + L").", false);
@@ -458,8 +604,11 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
 
     PhotoRotation rotation;
     rotation.Reset(std::move(photos), ReadLastSelection(date));
+    wchar_t targetLabel[39]{};
+    if (virtualDesktop) StringFromGUID2(targetId, targetLabel, ARRAYSIZE(targetLabel));
     ApplyResult lastFailure{E_FAIL, L"Apply wallpaper"};
     const bool updated = rotation.Advance([&](const fs::path& photo) {
+        if (lastFailure.stop) return false;
         const auto result = apply(photo);
         if (FAILED(result.status)) {
             lastFailure = result;
@@ -470,7 +619,9 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
         const auto selection = DatePrefix(date) + photo.native();
         const auto saved = RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, kLastSelection, REG_SZ,
             selection.c_str(), static_cast<DWORD>((selection.size() + 1) * sizeof(wchar_t)));
-        std::wstring message = virtualDesktop ? L"Updated current virtual desktop: " : L"Updated primary monitor: ";
+        std::wstring message = virtualDesktop ?
+            L"Updated current virtual desktop " + std::wstring(targetLabel) + L": " :
+            L"Updated primary monitor: ";
         WriteOutput(output, message + photo.native() + L"\r\n");
         if (saved != ERROR_SUCCESS) {
             WriteOutput(output, L"Could not save the next rotation position.\r\n");
