@@ -71,10 +71,9 @@ std::vector<fs::path> ScanPhotos(const fs::path& folder, MonthDay date,
     return matches;
 }
 
-void PhotoRotation::Reset(std::vector<fs::path> photos, const fs::path& previous) {
+void PhotoRotation::Reset(std::vector<fs::path> photos) {
     photos_ = std::move(photos);
-    const auto found = std::ranges::find(photos_, previous);
-    next_ = found == photos_.end() ? 0 : (found - photos_.begin() + 1) % photos_.size();
+    next_ = 0;
 }
 
 bool PhotoRotation::Advance(const std::function<bool(const fs::path&)>& display) {
@@ -132,15 +131,10 @@ namespace {
 using namespace on_this_day;
 namespace fs = std::filesystem;
 
-struct CalendarDate {
-    unsigned year;
-    MonthDay monthDay;
-};
-
-CalendarDate Today() {
+MonthDay Today() {
     SYSTEMTIME time{};
     GetLocalTime(&time);
-    return {time.wYear, {time.wMonth, time.wDay}};
+    return {time.wMonth, time.wDay};
 }
 
 HANDLE OpenCommandLineOutput() {
@@ -170,9 +164,9 @@ bool WriteOutput(HANDLE output, const std::wstring& text) {
         written == static_cast<DWORD>(utf8Size);
 }
 
-bool PrintMatches(HANDLE output, CalendarDate date, const std::vector<fs::path>& photos) {
+bool PrintMatches(HANDLE output, MonthDay date, const std::vector<fs::path>& photos) {
     wchar_t day[16]{};
-    swprintf_s(day, L"%02u-%02u", date.monthDay.month, date.monthDay.day);
+    swprintf_s(day, L"%02u-%02u", date.month, date.day);
     if (!WriteOutput(output, L"System.Photo.DateTaken " + std::wstring(day) + L": " +
             std::to_wstring(photos.size()) + L" matching photo(s)\r\n")) return false;
     for (const auto& photo : photos) {
@@ -199,8 +193,6 @@ fs::path ResolveFolder(const wchar_t* argument) {
 
 constexpr wchar_t kDesktopKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
-constexpr wchar_t kSettingsKey[] = L"Software\\OnThisDayBackground";
-constexpr wchar_t kLastSelection[] = L"LastSelection";
 constexpr wchar_t kQueryServiceOperation[] = L"QueryService";
 constexpr GUID kImmersiveShell{0xC2F03A33, 0x21F5, 0x47FA,
     {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
@@ -533,25 +525,6 @@ HRESULT GetPrimaryMonitorWallpaper(ApplyWallpaper& apply) {
     return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 }
 
-std::wstring DatePrefix(CalendarDate date) {
-    wchar_t prefix[24]{};
-    swprintf_s(prefix, L"%04u-%02u-%02u\n", date.year, date.monthDay.month, date.monthDay.day);
-    return prefix;
-}
-
-fs::path ReadLastSelection(CalendarDate date) {
-    DWORD bytes = 0;
-    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kLastSelection, RRF_RT_REG_SZ,
-            nullptr, nullptr, &bytes) != ERROR_SUCCESS || bytes % sizeof(wchar_t) != 0) return {};
-    std::wstring value(bytes / sizeof(wchar_t), L'\0');
-    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kLastSelection, RRF_RT_REG_SZ,
-            nullptr, value.data(), &bytes) != ERROR_SUCCESS || bytes < sizeof(wchar_t)) return {};
-    value.resize(bytes / sizeof(wchar_t) - 1);
-    const auto prefix = DatePrefix(date);
-    if (!value.starts_with(prefix)) return {};
-    return value.substr(prefix.size());
-}
-
 std::wstring DescribeError(HRESULT status) {
     wchar_t value[24]{};
     swprintf_s(value, L"0x%08lX", static_cast<unsigned long>(status));
@@ -565,16 +538,9 @@ int ReportFailure(HANDLE output, const std::wstring& message, bool list) {
     return 1;
 }
 
-int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> photos) {
-    if (photos.empty()) return 0;
-    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(
-        CreateMutexW(nullptr, FALSE, L"Local\\OnThisDayBackground.Wallpaper"), &CloseHandle);
-    const DWORD wait = mutex ? WaitForSingleObject(mutex.get(), 5000) : WAIT_FAILED;
-    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
-        return ReportFailure(output, L"Could not acquire the wallpaper update lock.", false);
-    }
-    // Closing a mutex handle does not release ownership until the thread exits.
-    const std::unique_ptr<void, decltype(&ReleaseMutex)> lock(mutex.get(), &ReleaseMutex);
+int ApplyNextWallpaper(PhotoRotation& rotation) {
+    if (rotation.Empty()) return 0;
+    const HANDLE output = nullptr;
 
     ApplyWallpaper apply;
     UINT desktops = 0;
@@ -602,8 +568,6 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
         }
     }
 
-    PhotoRotation rotation;
-    rotation.Reset(std::move(photos), ReadLastSelection(date));
     wchar_t targetLabel[39]{};
     if (virtualDesktop) StringFromGUID2(targetId, targetLabel, ARRAYSIZE(targetLabel));
     ApplyResult lastFailure{E_FAIL, L"Apply wallpaper"};
@@ -612,20 +576,15 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
         const auto result = apply(photo);
         if (FAILED(result.status)) {
             lastFailure = result;
-            WriteOutput(output, std::wstring(result.operation) + L" could not apply " + photo.native() +
-                L" (Windows build " + std::to_wstring(build) + L", " + DescribeError(result.status) + L").\r\n");
+            const auto diagnostic = std::wstring(result.operation) + L" could not apply " + photo.native() +
+                L" (Windows build " + std::to_wstring(build) + L", " + DescribeError(result.status) + L").\r\n";
+            OutputDebugStringW(diagnostic.c_str());
             return false;
         }
-        const auto selection = DatePrefix(date) + photo.native();
-        const auto saved = RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, kLastSelection, REG_SZ,
-            selection.c_str(), static_cast<DWORD>((selection.size() + 1) * sizeof(wchar_t)));
-        std::wstring message = virtualDesktop ?
+        const auto message = virtualDesktop ?
             L"Updated current virtual desktop " + std::wstring(targetLabel) + L": " :
             L"Updated primary monitor: ";
-        WriteOutput(output, message + photo.native() + L"\r\n");
-        if (saved != ERROR_SUCCESS) {
-            WriteOutput(output, L"Could not save the next rotation position.\r\n");
-        }
+        OutputDebugStringW((message + photo.native() + L"\r\n").c_str());
         return true;
     });
     if (updated) return 0;
@@ -633,41 +592,218 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
         std::to_wstring(build) + L", " + lastFailure.operation + L" (" +
         DescribeError(lastFailure.status) + L").", false);
 }
+constexpr wchar_t kResidentClass[] = L"OnThisDayBackground.Resident";
+constexpr wchar_t kResidentMutex[] = L"Local\\OnThisDayBackground.Resident";
+constexpr UINT kNextWallpaper = WM_APP + 1;
+
+HWND FindResident() {
+    return FindWindowExW(HWND_MESSAGE, nullptr, kResidentClass, nullptr);
+}
+
+struct Resident {
+    PhotoRotation rotation;
+    std::size_t pending = 0;
+    bool busy = true;
+    bool stopping = false;
+};
+
+void ProcessRequests(HWND window, Resident& state) {
+    if (state.busy) return;
+    state.busy = true;
+    while (state.pending && !state.stopping) {
+        --state.pending;
+        try {
+            ApplyNextWallpaper(state.rotation);
+        } catch (const std::exception&) {
+            ReportFailure(nullptr, L"Could not apply a photo from the cached list.", false);
+        }
+    }
+    state.busy = false;
+    if (state.stopping) DestroyWindow(window);
+}
+
+LRESULT CALLBACK ResidentProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    }
+    auto* state = reinterpret_cast<Resident*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (state) {
+        switch (message) {
+        case kNextWallpaper:
+            ++state->pending;
+            ProcessRequests(window, *state);
+            return 0;
+        case WM_CLOSE:
+            state->stopping = true;
+            if (!state->busy) DestroyWindow(window);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        }
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+int RunResident(HINSTANCE instance, const fs::path& folder) {
+    HANDLE raw = CreateMutexW(nullptr, TRUE, kResidentMutex);
+    const DWORD created = GetLastError();
+    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(raw, &CloseHandle);
+    if (!mutex) return ReportFailure(nullptr, L"Could not open the background instance lock.", false);
+    if (created == ERROR_ALREADY_EXISTS) {
+        const auto deadline = GetTickCount64() + 5000;
+        for (;;) {
+            const DWORD wait = WaitForSingleObject(mutex.get(), 0);
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) break;
+            if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) {
+                return ReportFailure(nullptr, L"Could not reach the running background instance.", false);
+            }
+            if (const HWND resident = FindResident()) {
+                if (PostMessageW(resident, kNextWallpaper, 0, 0)) return 0;
+            }
+            Sleep(25);
+        }
+    }
+    const std::unique_ptr<void, decltype(&ReleaseMutex)> lock(mutex.get(), &ReleaseMutex);
+
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        return ReportFailure(nullptr, L"Could not initialize the Windows shell interfaces.", false);
+    }
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    Resident state;
+    WNDCLASSW windowClass{};
+    windowClass.hInstance = instance;
+    windowClass.lpfnWndProc = ResidentProc;
+    windowClass.lpszClassName = kResidentClass;
+    HWND window = nullptr;
+    if (RegisterClassW(&windowClass)) {
+        window = CreateWindowExW(0, kResidentClass, nullptr, 0, 0, 0, 0, 0,
+            HWND_MESSAGE, nullptr, instance, &state);
+    }
+
+    int result = 1;
+    if (!window) {
+        ReportFailure(nullptr, L"Could not start the background message window.", false);
+    } else {
+        try {
+            state.rotation.Reset(ScanPhotos(folder, Today(), ReadDateTaken));
+            state.busy = false;
+            ProcessRequests(window, state);
+            MSG message{};
+            BOOL received;
+            while ((received = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if (received == 0) result = static_cast<int>(message.wParam);
+        } catch (const std::exception&) {
+            ReportFailure(nullptr, L"Could not scan the requested photo folder.", false);
+        }
+        if (IsWindow(window)) DestroyWindow(window);
+    }
+    CoUninitialize();
+    return result;
+}
+
+std::wstring QuotePath(const fs::path& path) {
+    auto quoted = L"\"" + path.native();
+    // Backslashes immediately before the closing quote must be doubled.
+    const auto last = path.native().find_last_not_of(L'\\');
+    quoted.append(path.native().size() - (last == std::wstring::npos ? 0 : last + 1), L'\\');
+    quoted += L'"';
+    return quoted;
+}
+
+int StartResident(const fs::path& folder) {
+    std::wstring executable(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (length == 0 || length >= executable.size()) {
+        return ReportFailure(nullptr, L"Could not locate OnThisDayBackground.exe.", false);
+    }
+    executable.resize(length);
+    auto command = QuotePath(executable) + L" --resident " + QuotePath(folder);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    // No inherited console or redirected standard handles are kept by the worker.
+    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS,
+            nullptr, nullptr, &startup, &process)) {
+        return ReportFailure(nullptr, L"Could not start the background process.", false);
+    }
+    CloseHandle(process.hThread);
+    const std::unique_ptr<void, decltype(&CloseHandle)> worker(process.hProcess, &CloseHandle);
+    const auto deadline = GetTickCount64() + 5000;
+    while (GetTickCount64() < deadline) {
+        if (WaitForSingleObject(worker.get(), 25) == WAIT_OBJECT_0) {
+            DWORD code = 1;
+            return GetExitCodeProcess(worker.get(), &code) ? static_cast<int>(code) : 1;
+        }
+        if (const HWND resident = FindResident()) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(resident, &pid);
+            if (pid == process.dwProcessId) return 0;
+        }
+    }
+    return 0;
+}
+
+int StopResident() {
+    const HWND window = FindResident();
+    if (!window) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (!pid) return 0;
+    const std::unique_ptr<void, decltype(&CloseHandle)> resident(
+        OpenProcess(SYNCHRONIZE, FALSE, pid), &CloseHandle);
+    if (!PostMessageW(window, WM_CLOSE, 0, 0)) return IsWindow(window) ? 1 : 0;
+    return resident && WaitForSingleObject(resident.get(), 5000) == WAIT_OBJECT_0 ? 0 : 1;
+}
+
+int ListPhotos(const fs::path& folder, HANDLE output) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        return ReportFailure(output, L"Could not initialize the Windows shell interfaces.", true);
+    }
+    int result = 1;
+    try {
+        const auto date = Today();
+        result = PrintMatches(output, date, ScanPhotos(folder, date, ReadDateTaken)) ? 0 : 1;
+    } catch (const std::exception&) {
+        result = ReportFailure(output, L"Could not scan the requested photo folder.", true);
+    }
+    CoUninitialize();
+    return result;
+}
 } // namespace
 
 #ifdef _MSC_VER
 _Use_decl_annotations_
 #endif
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     const std::unique_ptr<wchar_t*, decltype(&LocalFree)> argv(
         CommandLineToArgvW(GetCommandLineW(), &argc), &LocalFree);
     if (!argv) return 1;
 
-    const HANDLE output = OpenCommandLineOutput();
-    const bool list = argc > 1 && std::wstring_view(argv.get()[1]) == L"--list";
+    const std::wstring_view option = argc > 1 ? argv.get()[1] : L"";
+    if (option == L"--resident" && argc == 3) return RunResident(instance, argv.get()[2]);
+    if (option == L"--stop" && argc == 2) return StopResident();
+
+    const bool list = option == L"--list";
+    if (!list && argc <= 2) {
+        if (const HWND resident = FindResident()) {
+            return PostMessageW(resident, kNextWallpaper, 0, 0) ? 0 : 1;
+        }
+    }
+
+    const HANDLE output = list ? OpenCommandLineOutput() : nullptr;
     const int folderIndex = list ? 2 : 1;
     const auto folder = argc <= folderIndex + 1 ?
         ResolveFolder(argc > folderIndex ? argv.get()[folderIndex] : nullptr) : fs::path{};
     if (folder.empty()) {
-        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [--list] [photo folder]", list);
+        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [--list] [photo folder], or --stop.", list);
     }
-
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-        return ReportFailure(output, L"Could not initialize the Windows shell interfaces.", list);
-    }
-    if (!list) SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    int result = 1;
-    try {
-        const auto date = Today();
-        auto photos = ScanPhotos(folder, date.monthDay, ReadDateTaken);
-        const bool printed = output && PrintMatches(output, date, photos);
-        result = list ? (printed ? 0 : 1) : ApplyNextWallpaper(output, date, std::move(photos));
-    } catch (const std::exception&) {
-        result = ReportFailure(output, L"Could not scan or apply photos from the requested folder.", list);
-    }
-    CoUninitialize();
-    return result;
+    return list ? ListPhotos(folder, output) : StartResident(folder);
 }
 
 #endif // _WIN32

@@ -45,13 +45,11 @@ int main() {
         Check(rotation.Advance([&](const fs::path& photo) { return photo == expected[1]; }),
             "skip missing or undecodable photo");
         Check(rotation.Advance(show) && shown.back() == expected[0], "advance after skipping");
-        rotation.Reset(expected, expected[0]);
-        Check(rotation.Advance(show) && shown.back() == expected[1], "resume after a previous launch");
-        rotation.Reset(expected, expected[1]);
-        Check(rotation.Advance(show) && shown.back() == expected[0], "wrap on restart");
-        rotation.Reset(expected, folder / "removed.jpg");
-        Check(rotation.Advance(show) && shown.back() == expected[0], "removed cursor begins at first photo");
+        rotation.Reset(expected);
+        Check(!rotation.Empty() && rotation.Advance(show) && shown.back() == expected[0],
+            "fresh resident starts at first photo");
         rotation.Reset({});
+        Check(rotation.Empty(), "empty cache");
         Check(!rotation.Advance(show), "empty rotation");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

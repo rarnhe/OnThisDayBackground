@@ -124,17 +124,68 @@ bool TestList(const fs::path& app, const fs::path& fixture, const fs::path& fold
         printed.find("Updated ") == std::string::npos && printed.ends_with("2 matching photo(s)\r\n" + paths);
 }
 
-bool TestOneShot(const fs::path& app, const fs::path& folder) {
-    if (!IsWindowsGui(app)) return false;
-    for (int invocation = 0; invocation < 2; ++invocation) {
-        PROCESS_INFORMATION process{};
-        if (!Launch(app, folder, process)) return false;
-        const bool exited = ExitedSuccessfully(process.hProcess, 5000);
-        if (!exited) TerminateProcess(process.hProcess, 1);
-        CloseHandle(process.hProcess);
-        if (!exited) return false;
+bool TestResident(const fs::path& app, const fs::path& folder) {
+    const auto findResident = [] {
+        return FindWindowExW(HWND_MESSAGE, nullptr, L"OnThisDayBackground.Resident", nullptr);
+    };
+    if (!IsWindowsGui(app) || findResident()) return false;
+
+    HANDLE pipeRead = nullptr, pipeWrite = nullptr;
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    if (!CreatePipe(&pipeRead, &pipeWrite, &attributes, 0)) return false;
+    const std::unique_ptr<void, decltype(&CloseHandle)> reader(pipeRead, &CloseHandle);
+    std::unique_ptr<void, decltype(&CloseHandle)> writer(pipeWrite, &CloseHandle);
+    if (!SetHandleInformation(reader.get(), HANDLE_FLAG_INHERIT, 0)) return false;
+
+    PROCESS_INFORMATION launcher{};
+    if (!Launch(app, folder, launcher, {}, writer.get())) return false;
+    writer.reset();
+    bool passed = ExitedSuccessfully(launcher.hProcess, 5000);
+    if (!passed) TerminateProcess(launcher.hProcess, 1);
+    CloseHandle(launcher.hProcess);
+
+    DWORD pendingBytes = 0;
+    passed = passed && !PeekNamedPipe(reader.get(), nullptr, 0, nullptr, &pendingBytes, nullptr) &&
+        GetLastError() == ERROR_BROKEN_PIPE;
+
+    HWND window = findResident();
+    DWORD pid = 0;
+    if (window) GetWindowThreadProcessId(window, &pid);
+    const std::unique_ptr<void, decltype(&CloseHandle)> worker(
+        pid ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr, &CloseHandle);
+    if (!worker) return false;
+    passed = passed && pid != launcher.dwProcessId && !IsWindowVisible(window);
+
+    for (int invocation = 0; passed && invocation < 2; ++invocation) {
+        // An active instance still accepts the trigger when the new argument
+        // names a nonexistent folder. It continues using its original cache.
+        PROCESS_INFORMATION trigger{};
+        if (!Launch(app, folder / "missing", trigger)) {
+            passed = false;
+            break;
+        }
+        const bool exited = ExitedSuccessfully(trigger.hProcess, 5000);
+        if (!exited) TerminateProcess(trigger.hProcess, 1);
+        CloseHandle(trigger.hProcess);
+        DWORD after = 0;
+        if (const HWND resident = findResident()) GetWindowThreadProcessId(resident, &after);
+        passed = exited && after == pid && WaitForSingleObject(worker.get(), 0) == WAIT_TIMEOUT;
     }
-    return true;
+
+    PROCESS_INFORMATION stop{};
+    if (Launch(app, {}, stop, L"--stop")) {
+        const bool exited = ExitedSuccessfully(stop.hProcess, 6000);
+        if (!exited) TerminateProcess(stop.hProcess, 1);
+        CloseHandle(stop.hProcess);
+        passed = passed && exited;
+    } else {
+        passed = false;
+    }
+    if (!ExitedSuccessfully(worker.get(), 1000)) {
+        TerminateProcess(worker.get(), 1);
+        passed = false;
+    }
+    return passed && !findResident();
 }
 
 bool TestDesktopInterfaceFamilies() {
@@ -173,8 +224,8 @@ int main() {
         passed = TestDesktopInterfaceFamilies();
     } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--desktop-guid") {
         passed = TestCurrentDesktopGuid();
-    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--one-shot") {
-        passed = TestOneShot(argv[2], folder);
+    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--resident") {
+        passed = TestResident(argv[2], folder);
     } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {
         passed = TestList(argv[2], argv[3], folder);
     } else if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {

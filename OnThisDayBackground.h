@@ -20,7 +20,8 @@ std::vector<std::filesystem::path> ScanPhotos(const std::filesystem::path& folde
 
 class PhotoRotation {
 public:
-    void Reset(std::vector<std::filesystem::path> photos, const std::filesystem::path& previous = {});
+    void Reset(std::vector<std::filesystem::path> photos);
+    bool Empty() const { return photos_.empty(); }
     bool Advance(const std::function<bool(const std::filesystem::path&)>& display);
 
 private:
