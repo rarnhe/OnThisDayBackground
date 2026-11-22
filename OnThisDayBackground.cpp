@@ -11,17 +11,14 @@
 #include <propsys.h>
 #include <shlobj.h>
 #include <shellapi.h>
-#include <wincodec.h>
+#include <servprov.h>
+#include <shobjidl.h>
+#include <winstring.h>
 #include <wrl/client.h>
 
-#include <cstddef>
-#include <cstdint>
 #include <cwchar>
-#include <limits>
-#include <map>
 #include <memory>
 #include <string_view>
-#include <thread>
 #endif
 
 namespace on_this_day {
@@ -41,17 +38,17 @@ bool IsImageExtension(const fs::path& path) {
 } // namespace
 
 std::vector<fs::path> ScanPhotos(const fs::path& folder, MonthDay date,
-    const PhotoDateReader& readDate, std::stop_token stop) {
+    const PhotoDateReader& readDate) {
     std::vector<fs::path> matches;
     std::vector<fs::path> directories{folder};
     // Walk each directory separately so a bad child cannot abort the entire scan.
-    while (!directories.empty() && !stop.stop_requested()) {
+    while (!directories.empty()) {
         auto directory = std::move(directories.back());
         directories.pop_back();
         std::error_code error;
         fs::directory_iterator entry(directory, fs::directory_options::skip_permission_denied, error);
         const fs::directory_iterator end;
-        for (; !error && entry != end && !stop.stop_requested(); entry.increment(error)) {
+        for (; !error && entry != end; entry.increment(error)) {
             std::error_code statusError;
             const auto status = entry->symlink_status(statusError);
             if (fs::is_directory(status)) {
@@ -69,14 +66,14 @@ std::vector<fs::path> ScanPhotos(const fs::path& folder, MonthDay date,
             }
         }
     }
-    if (stop.stop_requested()) return {};
     std::ranges::sort(matches);
     return matches;
 }
 
-void PhotoRotation::Reset(std::vector<fs::path> photos) {
+void PhotoRotation::Reset(std::vector<fs::path> photos, const fs::path& previous) {
     photos_ = std::move(photos);
-    next_ = 0;
+    const auto found = std::ranges::find(photos_, previous);
+    next_ = found == photos_.end() ? 0 : (found - photos_.begin() + 1) % photos_.size();
 }
 
 bool PhotoRotation::Advance(const std::function<bool(const fs::path&)>& display) {
@@ -115,290 +112,15 @@ std::optional<MonthDay> ReadDateTaken(const std::filesystem::path& photo) {
     return MonthDay{local.wMonth, local.wDay};
 }
 
-HBITMAP LoadPhoto(const std::filesystem::path& photo) {
-    ComPtr<IWICImagingFactory> factory;
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> converter;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory))) ||
-        FAILED(factory->CreateDecoderFromFilename(photo.c_str(), nullptr, GENERIC_READ,
-            WICDecodeMetadataCacheOnDemand, &decoder)) ||
-        FAILED(decoder->GetFrame(0, &frame)) ||
-        FAILED(factory->CreateFormatConverter(&converter))) {
-        return nullptr;
-    }
-
-    ComPtr<IWICBitmapSource> source;
-    if (FAILED(frame.As(&source))) return nullptr;
-    ComPtr<IWICMetadataQueryReader> metadata;
-    if (SUCCEEDED(frame->GetMetadataQueryReader(&metadata))) {
-        PROPVARIANT orientation{};
-        const auto jpeg = metadata->GetMetadataByName(L"/app1/ifd/{ushort=274}", &orientation);
-        if (FAILED(jpeg)) {
-            PropVariantClear(&orientation);
-            metadata->GetMetadataByName(L"/ifd/{ushort=274}", &orientation);
-        }
-        constexpr WICBitmapTransformOptions transforms[] = {
-            WICBitmapTransformRotate0, WICBitmapTransformRotate0, WICBitmapTransformFlipHorizontal,
-            WICBitmapTransformRotate180, WICBitmapTransformFlipVertical,
-            static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
-            WICBitmapTransformRotate90,
-            static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal),
-            WICBitmapTransformRotate270
-        };
-        if (orientation.vt == VT_UI2 && orientation.uiVal > 1 && orientation.uiVal < 9) {
-            ComPtr<IWICBitmapFlipRotator> rotated;
-            if (SUCCEEDED(factory->CreateBitmapFlipRotator(&rotated)) &&
-                SUCCEEDED(rotated->Initialize(frame.Get(), transforms[orientation.uiVal]))) {
-                rotated.As(&source);
-            }
-        }
-        PropVariantClear(&orientation);
-    }
-
-    UINT width = 0, height = 0;
-    if (FAILED(converter->Initialize(source.Get(), GUID_WICPixelFormat32bppBGR,
-            WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)) ||
-        FAILED(converter->GetSize(&width, &height)) || width == 0 || height == 0 ||
-        width > std::numeric_limits<UINT>::max() / 4 ||
-        height > static_cast<UINT>(std::numeric_limits<LONG>::max()) ||
-        height > std::numeric_limits<UINT>::max() / (width * 4)) {
-        return nullptr;
-    }
-
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(info.bmiHeader);
-    info.bmiHeader.biWidth = static_cast<LONG>(width);
-    info.bmiHeader.biHeight = -static_cast<LONG>(height);
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    void* pixels = nullptr;
-    HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    if (bitmap && FAILED(converter->CopyPixels(nullptr, width * 4, width * 4 * height,
-            static_cast<BYTE*>(pixels)))) {
-        DeleteObject(bitmap);
-        return nullptr;
-    }
-    return bitmap;
-}
-} // namespace on_this_day
-
-namespace on_this_day {
-namespace {
-constexpr wchar_t kBackgroundClass[] = L"OnThisDayBackground.PhotoLayer";
-constexpr wchar_t kDesktopKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
-
-struct ShellLayer {
-    HWND parent = nullptr;
-    HWND icons = nullptr;
-};
-
-bool SameProcess(HWND first, HWND second) {
-    DWORD firstPid = 0, secondPid = 0;
-    GetWindowThreadProcessId(first, &firstPid);
-    GetWindowThreadProcessId(second, &secondPid);
-    return firstPid != 0 && firstPid == secondPid;
-}
-
-ShellLayer FindShellLayer(HWND progman) {
-    if (GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) {
-        const HWND icons = FindWindowExW(progman, nullptr, L"SHELLDLL_DefView", nullptr);
-        // On the raised desktop the layer must be a sibling between DefView and WorkerW.
-        if (icons && FindWindowExW(progman, icons, L"WorkerW", nullptr)) return {progman, icons};
-        return {};
-    }
-
-    for (HWND root = GetTopWindow(nullptr); root; root = GetWindow(root, GW_HWNDNEXT)) {
-        if (!SameProcess(progman, root) ||
-            !FindWindowExW(root, nullptr, L"SHELLDLL_DefView", nullptr)) continue;
-        for (HWND worker = FindWindowExW(nullptr, root, L"WorkerW", nullptr); worker;
-             worker = FindWindowExW(nullptr, worker, L"WorkerW", nullptr)) {
-            if (SameProcess(progman, worker) && IsWindowVisible(worker) &&
-                !FindWindowExW(worker, nullptr, L"SHELLDLL_DefView", nullptr)) return {worker, nullptr};
-        }
-    }
-    return {};
-}
-} // namespace
-
-std::optional<std::wstring> CurrentVirtualDesktop() {
-    GUID desktop{};
-    auto read = [&desktop](const wchar_t* key, const wchar_t* name) {
-        DWORD bytes = sizeof(desktop);
-        const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, key, name,
-            RRF_RT_REG_BINARY, nullptr, &desktop, &bytes);
-        return status == ERROR_SUCCESS && bytes != sizeof(desktop) ? ERROR_INVALID_DATA : status;
-    };
-
-    bool found = read(kDesktopKey, L"CurrentVirtualDesktop") == ERROR_SUCCESS;
-    DWORD session = 0;
-    if (!found && ProcessIdToSessionId(GetCurrentProcessId(), &session)) {
-        auto key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\" +
-            std::to_wstring(session) + L"\\VirtualDesktops";
-        found = read(key.c_str(), L"CurrentVirtualDesktop") == ERROR_SUCCESS;
-    }
-    if (!found) {
-        const auto result = read(kDesktopKey, L"VirtualDesktopIDs");
-        if (result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND) {
-            // A fresh Explorer profile can have no virtual-desktop registry state.
-            desktop = GUID{};
-        } else if (result != ERROR_SUCCESS) {
-            return std::nullopt;
-        }
-    }
-
-    wchar_t id[39]{};
-    if (!StringFromGUID2(desktop, id, ARRAYSIZE(id))) return std::nullopt;
-    return std::wstring(id);
-}
-
-bool DesktopHasFocus() {
-    const HWND shell = GetShellWindow();
-    const HWND foreground = GetForegroundWindow();
-    if (!shell || !foreground || !SameProcess(shell, foreground)) return false;
-    wchar_t name[32]{};
-    GetClassNameW(foreground, name, ARRAYSIZE(name));
-    return (foreground == shell || std::wstring_view(name) == L"Progman" ||
-        std::wstring_view(name) == L"WorkerW") &&
-        FindWindowExW(foreground, nullptr, L"SHELLDLL_DefView", nullptr);
-}
-
-DesktopBackground::~DesktopBackground() {
-    Hide();
-    Detach();
-}
-
-void DesktopBackground::Hide() {
-    if (window_ && IsWindow(window_)) ShowWindow(window_, SW_HIDE);
-    if (bitmap_) DeleteObject(bitmap_);
-    bitmap_ = nullptr;
-}
-
-void DesktopBackground::Detach() {
-    if (window_ && IsWindow(window_)) DestroyWindow(window_);
-    window_ = nullptr;
-}
-
-bool DesktopBackground::Place() {
-    const HWND progman = GetShellWindow();
-    if (!progman) return false;
-    auto layer = FindShellLayer(progman);
-    if (!layer.parent) {
-        // Explorer creates its separate wallpaper layer on demand.
-        SendMessageTimeoutW(progman, 0x052C, 0xD, 1, SMTO_ABORTIFHUNG, 200, nullptr);
-        layer = FindShellLayer(progman);
-    }
-    if (!layer.parent) return false;
-
-    MONITORINFO primary{sizeof(MONITORINFO)};
-    if (!GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &primary) ||
-        !(primary.dwFlags & MONITORINFOF_PRIMARY)) return false;
-    POINT origin{primary.rcMonitor.left, primary.rcMonitor.top};
-    if (!ScreenToClient(layer.parent, &origin)) return false;
-    const int width = primary.rcMonitor.right - primary.rcMonitor.left;
-    const int height = primary.rcMonitor.bottom - primary.rcMonitor.top;
-
-    if (!window_ || GetParent(window_) != layer.parent) {
-        Detach();
-        WNDCLASSW windowClass{};
-        windowClass.hInstance = instance_;
-        windowClass.lpfnWndProc = PaintWindow;
-        windowClass.lpszClassName = kBackgroundClass;
-        if (!RegisterClassW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
-        window_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-            kBackgroundClass, nullptr, WS_CHILD, origin.x, origin.y, width, height,
-            layer.parent, nullptr, instance_, this);
-        if (!window_ || !SetLayeredWindowAttributes(window_, 0, 255, LWA_ALPHA)) {
-            Detach();
-            return false;
-        }
-    }
-
-    RECT bounds{};
-    if (GetWindowRect(window_, &bounds) && EqualRect(&bounds, &primary.rcMonitor) &&
-        GetWindow(window_, GW_HWNDPREV) == layer.icons && IsWindowVisible(window_)) return true;
-    return SetWindowPos(window_, layer.icons ? layer.icons : HWND_TOP, origin.x, origin.y,
-        width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW) != FALSE;
-}
-
-BackgroundResult DesktopBackground::Show(const std::filesystem::path& photo) {
-    HBITMAP next = LoadPhoto(photo);
-    if (!next) return BackgroundResult::photoDecodeFailed;
-    const HBITMAP previous = bitmap_;
-    bitmap_ = next;
-    if (!Place()) {
-        bitmap_ = previous;
-        DeleteObject(next);
-        return BackgroundResult::placementFailed;
-    }
-    if (previous) DeleteObject(previous);
-    InvalidateRect(window_, nullptr, FALSE);
-    return BackgroundResult::applied;
-}
-
-void DesktopBackground::UpdatePlacement() {
-    if (bitmap_ && !Place()) Detach();
-}
-
-LRESULT CALLBACK DesktopBackground::PaintWindow(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
-    }
-    if (message == WM_NCHITTEST) return HTTRANSPARENT;
-    if (message != WM_PAINT) return DefWindowProcW(window, message, wParam, lParam);
-
-    PAINTSTRUCT paint{};
-    const HDC canvas = BeginPaint(window, &paint);
-    const auto* layer = reinterpret_cast<const DesktopBackground*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    BITMAP photo{};
-    if (layer && layer->bitmap_ && GetObjectW(layer->bitmap_, sizeof(photo), &photo)) {
-        RECT bounds{};
-        GetClientRect(window, &bounds);
-        const auto width = static_cast<std::int64_t>(bounds.right);
-        const auto height = static_cast<std::int64_t>(bounds.bottom);
-        if (width > 0 && height > 0) {
-            int sourceWidth = photo.bmWidth, sourceHeight = photo.bmHeight;
-            if (sourceWidth * height > sourceHeight * width) {
-                sourceWidth = static_cast<int>(sourceHeight * width / height);
-            } else {
-                sourceHeight = static_cast<int>(sourceWidth * height / width);
-            }
-            const HDC source = CreateCompatibleDC(canvas);
-            if (source) {
-                const HGDIOBJ previous = SelectObject(source, layer->bitmap_);
-                SetStretchBltMode(canvas, HALFTONE);
-                SetBrushOrgEx(canvas, 0, 0, nullptr);
-                StretchBlt(canvas, 0, 0, bounds.right, bounds.bottom, source,
-                    (photo.bmWidth - sourceWidth) / 2, (photo.bmHeight - sourceHeight) / 2,
-                    sourceWidth > 0 ? sourceWidth : 1, sourceHeight > 0 ? sourceHeight : 1, SRCCOPY);
-                SelectObject(source, previous);
-                DeleteDC(source);
-            }
-        }
-    }
-    EndPaint(window, &paint);
-    return 0;
-}
 } // namespace on_this_day
 
 namespace {
 using namespace on_this_day;
 namespace fs = std::filesystem;
 
-constexpr wchar_t kControllerClass[] = L"OnThisDayBackground.Controller";
-constexpr wchar_t kMutexName[] = L"Local\\OnThisDayBackground";
-constexpr UINT kRefresh = WM_APP + 1;
-constexpr UINT kScanComplete = WM_APP + 2;
-constexpr UINT kTray = WM_APP + 3;
-constexpr UINT kShowMenu = WM_APP + 4;
-constexpr UINT_PTR kTick = 1;
-
 struct CalendarDate {
     unsigned year;
     MonthDay monthDay;
-    bool operator==(const CalendarDate&) const = default;
 };
 
 CalendarDate Today() {
@@ -434,269 +156,15 @@ bool WriteOutput(HANDLE output, const std::wstring& text) {
         written == static_cast<DWORD>(utf8Size);
 }
 
-bool PrintMatches(HANDLE output, CalendarDate date, const std::vector<fs::path>& photos,
-    std::stop_token stop = {}) {
+bool PrintMatches(HANDLE output, CalendarDate date, const std::vector<fs::path>& photos) {
     wchar_t day[16]{};
     swprintf_s(day, L"%02u-%02u", date.monthDay.month, date.monthDay.day);
     if (!WriteOutput(output, L"System.Photo.DateTaken " + std::wstring(day) + L": " +
             std::to_wstring(photos.size()) + L" matching photo(s)\r\n")) return false;
     for (const auto& photo : photos) {
-        if (stop.stop_requested() || !WriteOutput(output, photo.native() + L"\r\n")) return false;
+        if (!WriteOutput(output, photo.native() + L"\r\n")) return false;
     }
     return true;
-}
-
-enum class RefreshSource { desktop, tray, terminal };
-
-const wchar_t* RefreshPrefix(RefreshSource source) {
-    switch (source) {
-    case RefreshSource::desktop: return L"[Desktop F5] ";
-    case RefreshSource::tray: return L"[Tray] ";
-    case RefreshSource::terminal: return L"[Terminal b] ";
-    }
-    return L"";
-}
-
-struct RefreshRequest {
-    std::wstring desktop;
-    RefreshSource source;
-};
-
-struct Controller {
-    Controller(HINSTANCE instance, fs::path directory, HANDLE commandLineOutput) :
-        folder(std::move(directory)), background(instance), output(commandLineOutput) {}
-
-    fs::path folder;
-    DesktopBackground background;
-    HANDLE output;
-    HANDLE input = nullptr;
-    bool terminalBDown = false;
-    HWND window = nullptr;
-    NOTIFYICONDATAW tray{};
-    UINT taskbarCreated = 0;
-    bool f5Down = false;
-    bool scanning = false;
-    std::vector<RefreshRequest> pendingRefreshes;
-    CalendarDate date{};
-    PhotoRotation rotation;
-    std::optional<std::wstring> desktop;
-    std::map<std::wstring, fs::path> displayed;
-    std::vector<fs::path> scanned;
-    std::jthread scanner;
-};
-
-void AddTrayIcon(Controller& state) {
-    state.tray.cbSize = sizeof(state.tray);
-    state.tray.hWnd = state.window;
-    state.tray.uID = 1;
-    state.tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    state.tray.uCallbackMessage = kTray;
-    state.tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(state.tray.szTip, L"OnThisDayBackground");
-    Shell_NotifyIconW(NIM_ADD, &state.tray);
-}
-
-void UpdateVirtualDesktop(Controller& state) {
-    auto desktop = CurrentVirtualDesktop();
-    if (desktop == state.desktop) {
-        state.background.UpdatePlacement();
-        return;
-    }
-    state.background.Hide();
-    state.desktop = std::move(desktop);
-    if (state.desktop) {
-        if (const auto saved = state.displayed.find(*state.desktop); saved != state.displayed.end()) {
-            state.background.Show(saved->second);
-        }
-    }
-}
-
-bool BeginScan(Controller& state, CalendarDate date) {
-    if (state.scanning || state.date == date) return true;
-    try {
-        state.scanner = std::jthread([&state, date](std::stop_token stop) {
-            std::vector<fs::path> result;
-            if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-                try {
-                    result = ScanPhotos(state.folder, date.monthDay, ReadDateTaken, stop);
-                    if (state.output && !stop.stop_requested()) {
-                        PrintMatches(state.output, date, result, stop);
-                    }
-                } catch (const std::exception& error) {
-                    OutputDebugStringA(error.what());
-                }
-                CoUninitialize();
-            }
-            state.scanned = std::move(result);
-            PostMessageW(state.window, kScanComplete, 0, 0);
-        });
-    } catch (const std::system_error&) {
-        return false;
-    }
-    state.date = date;
-    state.scanning = true;
-    state.rotation.Reset({});
-    return true;
-}
-
-void LogRefresh(const Controller& state, RefreshSource source, std::wstring message) {
-    if (state.output) WriteOutput(state.output, RefreshPrefix(source) + message + L"\r\n");
-}
-
-void RefreshDesktop(Controller& state, const RefreshRequest& request) {
-    UpdateVirtualDesktop(state);
-    bool placementFailed = false;
-    const bool applied = state.rotation.Advance([&](const fs::path& photo) {
-        if (placementFailed) return false;
-        if (state.desktop == request.desktop) {
-            const auto result = state.background.Show(photo);
-            if (result == BackgroundResult::photoDecodeFailed) {
-                LogRefresh(state, request.source, L"Cannot decode photo: " + photo.native());
-                return false;
-            }
-            if (result == BackgroundResult::placementFailed) {
-                placementFailed = true;
-                LogRefresh(state, request.source, L"Cannot place the wallpaper layer behind Explorer icons: " +
-                    photo.native());
-                return false;
-            }
-            LogRefresh(state, request.source, L"Wallpaper layer updated: " + photo.native());
-        } else {
-            // A refresh queued during the scan still belongs to the desktop that requested it.
-            HBITMAP bitmap = LoadPhoto(photo);
-            if (!bitmap) {
-                LogRefresh(state, request.source, L"Cannot decode photo: " + photo.native());
-                return false;
-            }
-            DeleteObject(bitmap);
-            LogRefresh(state, request.source, L"Photo selected for the inactive desktop: " + photo.native());
-        }
-        state.displayed[request.desktop] = photo;
-        return true;
-    });
-    if (!applied) LogRefresh(state, request.source, L"No matching photo could be applied.");
-}
-
-void Refresh(Controller& state, RefreshSource source) {
-    LogRefresh(state, source, L"Refresh received.");
-    const auto desktop = CurrentVirtualDesktop();
-    if (!desktop) {
-        LogRefresh(state, source, L"Cannot identify the current virtual desktop.");
-        return;
-    }
-    if (!BeginScan(state, Today())) {
-        LogRefresh(state, source, L"Cannot start the photo scan.");
-        return;
-    }
-
-    RefreshRequest request{*desktop, source};
-    if (state.scanning) {
-        LogRefresh(state, source, L"Waiting for the photo scan to finish.");
-        state.pendingRefreshes.push_back(std::move(request));
-    } else {
-        RefreshDesktop(state, request);
-    }
-}
-
-void PollTerminalInput(Controller& state) {
-    if (!state.input) return;
-    INPUT_RECORD events[32]{};
-    DWORD available = 0, read = 0;
-    if (!PeekConsoleInputW(state.input, events, ARRAYSIZE(events), &available) || !available ||
-        !ReadConsoleInputW(state.input, events, available, &read)) return;
-    for (DWORD i = 0; i < read; ++i) {
-        if (events[i].EventType != KEY_EVENT) continue;
-        const auto& key = events[i].Event.KeyEvent;
-        if (key.wVirtualKeyCode != 'B') continue;
-        if (!key.bKeyDown) {
-            state.terminalBDown = false;
-        } else if (!std::exchange(state.terminalBDown, true) &&
-            (key.uChar.UnicodeChar == L'b' || key.uChar.UnicodeChar == L'B')) {
-            Refresh(state, RefreshSource::terminal);
-        }
-    }
-}
-
-void OnKeyboardInput(Controller& state, HRAWINPUT handle) {
-    RAWINPUT input{};
-    UINT size = sizeof(input);
-    const UINT copied = GetRawInputData(handle, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER));
-    if (copied == static_cast<UINT>(-1) || copied < offsetof(RAWINPUT, data) + sizeof(RAWKEYBOARD) ||
-        input.header.dwType != RIM_TYPEKEYBOARD || input.data.keyboard.VKey != VK_F5) return;
-    if (input.data.keyboard.Flags & RI_KEY_BREAK) {
-        state.f5Down = false;
-    } else if (!std::exchange(state.f5Down, true) && !(GetAsyncKeyState(VK_MENU) & 0x8000) &&
-        !(GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
-        !(GetAsyncKeyState(VK_LWIN) & 0x8000) && !(GetAsyncKeyState(VK_RWIN) & 0x8000) &&
-        DesktopHasFocus()) {
-        Refresh(state, RefreshSource::desktop);
-    }
-}
-
-void ShowTrayMenu(Controller& state) {
-    const HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    AppendMenuW(menu, MF_STRING, 1, L"Refresh wallpaper");
-    AppendMenuW(menu, MF_STRING, 2, L"Exit");
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    SetForegroundWindow(state.window);
-    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-        cursor.x, cursor.y, 0, state.window, nullptr);
-    PostMessageW(state.window, WM_NULL, 0, 0);
-    DestroyMenu(menu);
-    if (command == 1) PostMessageW(state.window, kRefresh, 0, 0);
-    if (command == 2) DestroyWindow(state.window);
-}
-
-LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
-    }
-    auto* state = reinterpret_cast<Controller*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (!state) return DefWindowProcW(window, message, wParam, lParam);
-    if (message == state->taskbarCreated && state->taskbarCreated != 0) {
-        AddTrayIcon(*state);
-        return 0;
-    }
-
-    switch (message) {
-    case kRefresh:
-        Refresh(*state, RefreshSource::tray);
-        return 0;
-    case kScanComplete:
-        state->scanner.join();
-        state->scanning = false;
-        state->rotation.Reset(std::move(state->scanned));
-        if (BeginScan(*state, Today()) && !state->scanning) {
-            for (const auto& request : state->pendingRefreshes) RefreshDesktop(*state, request);
-            state->pendingRefreshes.clear();
-        }
-        return 0;
-    case WM_INPUT:
-        OnKeyboardInput(*state, reinterpret_cast<HRAWINPUT>(lParam));
-        return DefWindowProcW(window, message, wParam, lParam);
-    case WM_TIMER:
-        PollTerminalInput(*state);
-        BeginScan(*state, Today());
-        if (!state->displayed.empty()) UpdateVirtualDesktop(*state);
-        return 0;
-    case kTray:
-        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) ShowTrayMenu(*state);
-        return 0;
-    case kShowMenu:
-        ShowTrayMenu(*state);
-        return 0;
-    case WM_DESTROY:
-        state->scanner.request_stop();
-        KillTimer(window, kTick);
-        Shell_NotifyIconW(NIM_DELETE, &state->tray);
-        PostQuitMessage(0);
-        return 0;
-    default:
-        return DefWindowProcW(window, message, wParam, lParam);
-    }
 }
 
 fs::path ResolveFolder(const wchar_t* argument) {
@@ -715,130 +183,266 @@ fs::path ResolveFolder(const wchar_t* argument) {
     return {};
 }
 
-int Run(HINSTANCE instance, fs::path folder, HANDLE output, HANDLE input) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    Controller state{instance, std::move(folder), output};
-    state.input = input;
-    state.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    WNDCLASSW windowClass{};
-    windowClass.hInstance = instance;
-    windowClass.lpfnWndProc = ControllerProc;
-    windowClass.lpszClassName = kControllerClass;
-    if (!RegisterClassW(&windowClass)) return 1;
-    state.window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        kControllerClass, nullptr, WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, &state);
-    if (!state.window) return 1;
+constexpr wchar_t kDesktopKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
+constexpr wchar_t kSettingsKey[] = L"Software\\OnThisDayBackground";
+constexpr wchar_t kLastSelection[] = L"LastSelection";
+constexpr GUID kImmersiveShell{0xC2F03A33, 0x21F5, 0x47FA,
+    {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
+constexpr GUID kDesktopManagerService{0xC5E0CDCA, 0x7B6E, 0x41B2,
+    {0x9F, 0xC4, 0xD9, 0x39, 0x75, 0xCC, 0x46, 0x7B}};
+constexpr GUID kManager24H2{0x53F5CA0B, 0x158F, 0x4124,
+    {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}};
+constexpr GUID kManager23H2{0x4970BA3D, 0xFD4E, 0x4647,
+    {0xBE, 0xA3, 0xD8, 0x90, 0x76, 0xEF, 0x4B, 0x9C}};
+constexpr GUID kManager22H2{0xA3175F2D, 0x239C, 0x4BD2,
+    {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}};
 
-    const RAWINPUTDEVICE keyboard{0x01, 0x06, RIDEV_INPUTSINK, state.window};
-    int result = 1;
-    if (RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard)) &&
-        SetTimer(state.window, kTick, 150, nullptr) && BeginScan(state, Today())) {
-        AddTrayIcon(state);
-        if (input) WriteOutput(output, L"Verification ready. Press b in this terminal or F5 on the desktop.\r\n");
-        MSG message{};
-        BOOL received;
-        while ((received = GetMessageW(&message, nullptr, 0, 0)) > 0) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-        if (received == 0) result = static_cast<int>(message.wParam);
+// Explorer's private ABI changes across releases. Unused declarations preserve
+// the slots before SetDesktopWallpaper and are never called.
+struct DesktopManager : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetCount(UINT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(IUnknown**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDesktops() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SwitchDesktop() = 0;
+};
+
+struct DesktopManager24H2 : DesktopManager {
+    virtual HRESULT STDMETHODCALLTYPE SwitchDesktopAndMoveForegroundView() = 0;
+};
+
+template<class Base>
+struct DesktopWallpaperManager : Base {
+    virtual HRESULT STDMETHODCALLTYPE CreateDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE MoveDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE RemoveDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDesktopSwitchIncludeExcludeViews() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDesktopName() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDesktopWallpaper(IUnknown*, HSTRING) = 0;
+};
+
+using ApplyWallpaper = std::function<HRESULT(const fs::path&)>;
+
+DWORD WindowsBuild() {
+    using QueryVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return 0;
+    const auto query = reinterpret_cast<QueryVersion>(GetProcAddress(ntdll, "RtlGetVersion"));
+    OSVERSIONINFOW info{};
+    info.dwOSVersionInfoSize = sizeof(info);
+    return query && query(&info) == 0 ? info.dwBuildNumber : 0;
+}
+
+template<class Manager>
+HRESULT GetVirtualDesktopWallpaper(IServiceProvider& shell, REFIID iid, UINT& count, ApplyWallpaper& apply) {
+    ComPtr<Manager> manager;
+    HRESULT status = shell.QueryService(kDesktopManagerService, iid,
+        reinterpret_cast<void**>(manager.GetAddressOf()));
+    if (FAILED(status)) return status;
+    status = manager->GetCount(&count);
+    if (FAILED(status) || count <= 1) return status;
+
+    // Query the current desktop at the moment of application, after scanning.
+    apply = [manager](const fs::path& photo) {
+        ComPtr<IUnknown> desktop;
+        const HRESULT status = manager->GetCurrentDesktop(desktop.GetAddressOf());
+        if (FAILED(status) || !desktop) return FAILED(status) ? status : E_UNEXPECTED;
+        HSTRING_HEADER storage{};
+        HSTRING path = nullptr;
+        const HRESULT result = WindowsCreateStringReference(photo.c_str(),
+            static_cast<UINT32>(photo.native().size()), &storage, &path);
+        return SUCCEEDED(result) ? manager->SetDesktopWallpaper(desktop.Get(), path) : result;
+    };
+    return S_OK;
+}
+
+HRESULT GetDesktopConfiguration(UINT& count, ApplyWallpaper& apply) {
+    const DWORD build = WindowsBuild();
+    if (build != 26100 && build != 26200 && build != 22621 && build != 22631) {
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
-    if (IsWindow(state.window)) DestroyWindow(state.window);
-    if (state.scanner.joinable()) {
-        state.scanner.request_stop();
-        state.scanner.join();
+
+    ComPtr<IServiceProvider> shell;
+    const HRESULT status = CoCreateInstance(kImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER,
+        IID_PPV_ARGS(shell.GetAddressOf()));
+    if (FAILED(status)) return status;
+    if (build == 26100 || build == 26200) {
+        return GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager24H2>>(
+            *shell.Get(), kManager24H2, count, apply);
+    }
+
+    HRESULT result = GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager>>(
+        *shell.Get(), kManager23H2, count, apply);
+    if (result == E_NOINTERFACE) {
+        result = GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager>>(
+            *shell.Get(), kManager22H2, count, apply);
+    }
+    if (result == E_NOINTERFACE) {
+        // Updated 23H2 also used this IID, before the extra 24H2 slot was added.
+        result = GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager>>(
+            *shell.Get(), kManager24H2, count, apply);
     }
     return result;
 }
 
-int RunSingleInstance(HINSTANCE instance, fs::path folder, HANDLE output, HANDLE input) {
-    HANDLE rawMutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    const DWORD status = GetLastError();
-    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(rawMutex, &CloseHandle);
-    if (!mutex) return 1;
-    if (status == ERROR_ALREADY_EXISTS) {
-        const auto deadline = GetTickCount64() + 5000;
-        for (;;) {
-            const DWORD wait = WaitForSingleObject(mutex.get(), 0);
-            if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) break;
-            if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) return 1;
-            if (const HWND existing = FindWindowW(kControllerClass, nullptr)) {
-                if (input) {
-                    WriteOutput(output, L"Exit the running instance from the tray, then start --verify again.\r\n");
-                    return 1;
-                }
-                DWORD process = 0;
-                GetWindowThreadProcessId(existing, &process);
-                if (process) AllowSetForegroundWindow(process);
-                if (PostMessageW(existing, kShowMenu, 0, 0)) return 0;
-            }
-            Sleep(25);
+bool IsSingleDesktopInRegistry() {
+    DWORD bytes = 0;
+    const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, kDesktopKey, L"VirtualDesktopIDs",
+        RRF_RT_REG_BINARY, nullptr, nullptr, &bytes);
+    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) return true;
+    return status == ERROR_SUCCESS && (bytes == 0 || bytes == sizeof(GUID));
+}
+
+HRESULT GetPrimaryMonitorWallpaper(ApplyWallpaper& apply) {
+    MONITORINFO primary{sizeof(primary)};
+    if (!GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &primary) ||
+        !(primary.dwFlags & MONITORINFOF_PRIMARY)) {
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+
+    ComPtr<IDesktopWallpaper> wallpaper;
+    HRESULT status = CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL,
+        IID_PPV_ARGS(wallpaper.GetAddressOf()));
+    if (FAILED(status)) return status;
+    UINT count = 0;
+    status = wallpaper->GetMonitorDevicePathCount(&count);
+    if (FAILED(status)) return status;
+
+    for (UINT index = 0; index < count; ++index) {
+        PWSTR path = nullptr;
+        status = wallpaper->GetMonitorDevicePathAt(index, &path);
+        const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> monitor(path, &CoTaskMemFree);
+        RECT bounds{};
+        if (SUCCEEDED(status) && monitor && wallpaper->GetMonitorRECT(monitor.get(), &bounds) == S_OK &&
+            EqualRect(&bounds, &primary.rcMonitor)) {
+            apply = [wallpaper, id = std::wstring(monitor.get())](const fs::path& photo) {
+                return wallpaper->SetWallpaper(id.c_str(), photo.c_str());
+            };
+            return S_OK;
+        }
+    }
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+std::wstring DatePrefix(CalendarDate date) {
+    wchar_t prefix[24]{};
+    swprintf_s(prefix, L"%04u-%02u-%02u\n", date.year, date.monthDay.month, date.monthDay.day);
+    return prefix;
+}
+
+fs::path ReadLastSelection(CalendarDate date) {
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kLastSelection, RRF_RT_REG_SZ,
+            nullptr, nullptr, &bytes) != ERROR_SUCCESS || bytes % sizeof(wchar_t) != 0) return {};
+    std::wstring value(bytes / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kLastSelection, RRF_RT_REG_SZ,
+            nullptr, value.data(), &bytes) != ERROR_SUCCESS || bytes < sizeof(wchar_t)) return {};
+    value.resize(bytes / sizeof(wchar_t) - 1);
+    const auto prefix = DatePrefix(date);
+    if (!value.starts_with(prefix)) return {};
+    return value.substr(prefix.size());
+}
+
+std::wstring DescribeError(HRESULT status) {
+    wchar_t value[24]{};
+    swprintf_s(value, L"0x%08lX", static_cast<unsigned long>(status));
+    return value;
+}
+
+int ReportFailure(HANDLE output, const std::wstring& message, bool list) {
+    if (!WriteOutput(output, message + L"\r\n") && !list) {
+        MessageBoxW(nullptr, message.c_str(), L"OnThisDayBackground", MB_OK | MB_ICONERROR);
+    }
+    return 1;
+}
+
+int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> photos) {
+    if (photos.empty()) return 0;
+    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(
+        CreateMutexW(nullptr, FALSE, L"Local\\OnThisDayBackground.Wallpaper"), &CloseHandle);
+    const DWORD wait = mutex ? WaitForSingleObject(mutex.get(), 5000) : WAIT_FAILED;
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+        return ReportFailure(output, L"Could not acquire the wallpaper update lock.", false);
+    }
+    // Closing a mutex handle does not release ownership until the thread exits.
+    const std::unique_ptr<void, decltype(&ReleaseMutex)> lock(mutex.get(), &ReleaseMutex);
+
+    ApplyWallpaper apply;
+    UINT desktops = 0;
+    const HRESULT desktopStatus = GetDesktopConfiguration(desktops, apply);
+    if (!apply && (desktops > 1 || ((FAILED(desktopStatus) || desktops == 0) && !IsSingleDesktopInRegistry()))) {
+        return ReportFailure(output, L"Cannot target the current virtual desktop on this Windows build (" +
+            DescribeError(FAILED(desktopStatus) ? desktopStatus : E_UNEXPECTED) + L").", false);
+    }
+
+    const bool virtualDesktop = static_cast<bool>(apply);
+    if (!apply) {
+        const HRESULT status = GetPrimaryMonitorWallpaper(apply);
+        if (FAILED(status)) {
+            return ReportFailure(output, L"Cannot find the primary monitor's wallpaper target (" +
+                DescribeError(status) + L").", false);
         }
     }
 
-    int result = 1;
-    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-        result = Run(instance, std::move(folder), output, input);
-        CoUninitialize();
-    }
-    ReleaseMutex(mutex.get());
-    return result;
-}
-int ListPhotos(const fs::path& folder, HANDLE output) {
-    if (!output || FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
-    int status = 1;
-    try {
-        const auto date = Today();
-        const auto photos = ScanPhotos(folder, date.monthDay, ReadDateTaken);
-        status = PrintMatches(output, date, photos) ? 0 : 1;
-    } catch (const std::exception&) {
-        WriteOutput(output, L"Could not scan the photo folder.\r\n");
-    }
-    CoUninitialize();
-    return status;
+    PhotoRotation rotation;
+    rotation.Reset(std::move(photos), ReadLastSelection(date));
+    const bool updated = rotation.Advance([&](const fs::path& photo) {
+        const HRESULT status = apply(photo);
+        if (FAILED(status)) {
+            WriteOutput(output, L"Could not apply " + photo.native() + L" (" + DescribeError(status) + L").\r\n");
+            return false;
+        }
+        const auto selection = DatePrefix(date) + photo.native();
+        const auto saved = RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, kLastSelection, REG_SZ,
+            selection.c_str(), static_cast<DWORD>((selection.size() + 1) * sizeof(wchar_t)));
+        std::wstring message = virtualDesktop ? L"Updated current virtual desktop: " : L"Updated primary monitor: ";
+        WriteOutput(output, message + photo.native() + L"\r\n");
+        if (saved != ERROR_SUCCESS) {
+            WriteOutput(output, L"Could not save the next rotation position.\r\n");
+        }
+        return true;
+    });
+    return updated ? 0 : ReportFailure(output, L"Windows could not apply any matching photo.", false);
 }
 } // namespace
 
 #ifdef _MSC_VER
 _Use_decl_annotations_
 #endif
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     const std::unique_ptr<wchar_t*, decltype(&LocalFree)> argv(
         CommandLineToArgvW(GetCommandLineW(), &argc), &LocalFree);
     if (!argv) return 1;
 
     const HANDLE output = OpenCommandLineOutput();
-    const std::wstring_view option = argc > 1 ? argv.get()[1] : L"";
-    const bool list = option == L"--list";
-    const bool verify = option == L"--verify";
-    const int folderIndex = list || verify ? 2 : 1;
-    if (argc <= folderIndex + 1) {
-        auto folder = ResolveFolder(argc > folderIndex ? argv.get()[folderIndex] : nullptr);
-        if (!folder.empty()) {
-            if (list) return ListPhotos(folder, output);
-            if (!verify) return RunSingleInstance(instance, std::move(folder), output, nullptr);
-
-            HANDLE rawInput = CreateFileW(L"CONIN$", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr, OPEN_EXISTING, 0, nullptr);
-            if (rawInput == INVALID_HANDLE_VALUE && AttachConsole(ATTACH_PARENT_PROCESS)) {
-                rawInput = CreateFileW(L"CONIN$", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_EXISTING, 0, nullptr);
-            }
-            if (rawInput == INVALID_HANDLE_VALUE) {
-                WriteOutput(output, L"Start --verify from a Windows terminal.\r\n");
-                return 1;
-            }
-            const std::unique_ptr<void, decltype(&CloseHandle)> input(rawInput, &CloseHandle);
-            return RunSingleInstance(instance, std::move(folder), output, input.get());
-        }
+    const bool list = argc > 1 && std::wstring_view(argv.get()[1]) == L"--list";
+    const int folderIndex = list ? 2 : 1;
+    const auto folder = argc <= folderIndex + 1 ?
+        ResolveFolder(argc > folderIndex ? argv.get()[folderIndex] : nullptr) : fs::path{};
+    if (folder.empty()) {
+        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [--list] [photo folder]", list);
     }
 
-    constexpr auto usage = L"Usage: OnThisDayBackground.exe [--list | --verify] [photo folder]";
-    if (!WriteOutput(output, std::wstring(usage) + L"\r\n") && !list) {
-        MessageBoxW(nullptr, usage, L"OnThisDayBackground", MB_OK | MB_ICONERROR);
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        return ReportFailure(output, L"Could not initialize the Windows shell interfaces.", list);
     }
-    return 1;
+    if (!list) SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    int result = 1;
+    try {
+        const auto date = Today();
+        auto photos = ScanPhotos(folder, date.monthDay, ReadDateTaken);
+        const bool printed = output && PrintMatches(output, date, photos);
+        result = list ? (printed ? 0 : 1) : ApplyNextWallpaper(output, date, std::move(photos));
+    } catch (const std::exception&) {
+        result = ReportFailure(output, L"Could not scan or apply photos from the requested folder.", list);
+    }
+    CoUninitialize();
+    return result;
 }
 
 #endif // _WIN32

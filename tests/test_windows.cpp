@@ -14,7 +14,9 @@
 using namespace on_this_day;
 namespace fs = std::filesystem;
 
-bool TestPhotoDecoder(const fs::path& folder) {
+bool TestDateTaken(const fs::path& fixture, const fs::path& folder) {
+    const auto photo = folder / fixture.filename();
+    fs::copy_file(fixture, photo, fs::copy_options::overwrite_existing);
     // 2x1 24-bit BMP with one row padded to eight bytes.
     constexpr std::array<unsigned char, 62> bytes{
         'B', 'M', 62, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0,
@@ -22,24 +24,13 @@ bool TestPhotoDecoder(const fs::path& folder) {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 255, 0, 255, 0, 0, 0
     };
-    const auto photo = folder / "2000-11-22.bmp";
-    std::ofstream(photo, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    HBITMAP bitmap = LoadPhoto(photo);
-    BITMAP info{};
-    const bool passed = bitmap &&
-        GetObjectW(bitmap, sizeof(info), &info) && info.bmWidth == 2 && info.bmHeight == 1;
-    if (bitmap) DeleteObject(bitmap);
-    return passed && !ReadDateTaken(photo) && !LoadPhoto(folder / "missing.bmp");
-}
-
-bool TestDateTaken(const fs::path& fixture, const fs::path& folder) {
-    const auto photo = folder / fixture.filename();
-    fs::copy_file(fixture, photo, fs::copy_options::overwrite_existing);
+    const auto undated = folder / "2000-11-22.bmp";
+    std::ofstream(undated, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     const MonthDay dateTaken{10, 7};
     return ReadDateTaken(photo) == dateTaken &&
         ScanPhotos(folder, dateTaken, ReadDateTaken) == std::vector{photo} &&
         ScanPhotos(folder, {8, 10}, ReadDateTaken).empty() &&
-        !ReadDateTaken(folder / "missing-2015-10-07.jpg");
+        !ReadDateTaken(undated) && !ReadDateTaken(folder / "missing-2015-10-07.jpg");
 }
 
 bool IsWindowsGui(const fs::path& program) {
@@ -130,118 +121,36 @@ bool TestList(const fs::path& app, const fs::path& fixture, const fs::path& fold
     const auto expected = first.u8string() + u8"\r\n" + second.u8string() + u8"\r\n";
     const std::string paths(expected.begin(), expected.end());
     return exited && printed.starts_with("System.Photo.DateTaken ") &&
-        printed.ends_with("2 matching photo(s)\r\n" + paths);
+        printed.find("Updated ") == std::string::npos && printed.ends_with("2 matching photo(s)\r\n" + paths);
 }
 
-bool TestTerminalRefresh(const fs::path& app, const fs::path& folder) {
-    // The hosted runner can invoke CTest with redirected stdio and no console.
-    DWORD processIds[1]{};
-    if (!GetConsoleProcessList(processIds, ARRAYSIZE(processIds)) && !AllocConsole()) return false;
-    const auto log = folder / "verify-stdout.txt";
-    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
-    const HANDLE rawOutput = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &attributes,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (rawOutput == INVALID_HANDLE_VALUE) return false;
-    const std::unique_ptr<void, decltype(&CloseHandle)> output(rawOutput, &CloseHandle);
-    const HANDLE rawInput = CreateFileW(L"CONIN$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_EXISTING, 0, nullptr);
-    if (rawInput == INVALID_HANDLE_VALUE) return false;
-    const std::unique_ptr<void, decltype(&CloseHandle)> input(rawInput, &CloseHandle);
-    PROCESS_INFORMATION process{};
-    if (!Launch(app, folder, process, L"--verify", output.get())) return false;
-
-    const auto waitForLog = [&](std::string_view message) {
-        for (int attempt = 0; attempt < 100; ++attempt) {
-            std::ifstream file(log, std::ios::binary);
-            const std::string content{std::istreambuf_iterator<char>(file), {}};
-            if (content.find(message) != std::string::npos) return true;
-            if (WaitForSingleObject(process.hProcess, 50) != WAIT_TIMEOUT) break;
-        }
-        return false;
-    };
-
-    bool passed = waitForLog("Verification ready.");
-    if (passed) {
-        INPUT_RECORD events[2]{};
-        events[0].EventType = KEY_EVENT;
-        events[0].Event.KeyEvent.bKeyDown = TRUE;
-        events[0].Event.KeyEvent.wRepeatCount = 1;
-        events[0].Event.KeyEvent.wVirtualKeyCode = 'B';
-        events[0].Event.KeyEvent.uChar.UnicodeChar = L'b';
-        events[1] = events[0];
-        events[1].Event.KeyEvent.bKeyDown = FALSE;
-        DWORD written = 0;
-        passed = WriteConsoleInputW(input.get(), events, ARRAYSIZE(events), &written) &&
-            written == ARRAYSIZE(events) && waitForLog("[Terminal b] Refresh received.");
+bool TestOneShot(const fs::path& app, const fs::path& folder) {
+    if (!IsWindowsGui(app)) return false;
+    for (int invocation = 0; invocation < 2; ++invocation) {
+        PROCESS_INFORMATION process{};
+        if (!Launch(app, folder, process)) return false;
+        const bool exited = ExitedSuccessfully(process.hProcess, 5000);
+        if (!exited) TerminateProcess(process.hProcess, 1);
+        CloseHandle(process.hProcess);
+        if (!exited) return false;
     }
-
-    if (const HWND window = FindWindowW(L"OnThisDayBackground.Controller", nullptr)) {
-        DWORD processId = 0;
-        GetWindowThreadProcessId(window, &processId);
-        if (processId == process.dwProcessId) PostMessageW(window, WM_CLOSE, 0, 0);
-    }
-    if (!ExitedSuccessfully(process.hProcess, 3000)) {
-        TerminateProcess(process.hProcess, 1);
-        passed = false;
-    }
-    CloseHandle(process.hProcess);
-    return passed;
+    return true;
 }
 
-bool TestGui(const fs::path& app, const fs::path& folder) {
-    PROCESS_INFORMATION process{};
-    // Explorer starts the .exe without arguments or console-hiding flags.
-    if (!IsWindowsGui(app) || !Launch(app, {}, process)) return false;
-    HWND window = nullptr;
-    for (int i = 0; i < 100; ++i) {
-        window = FindWindowW(L"OnThisDayBackground.Controller", nullptr);
-        DWORD pid = 0;
-        if (window && GetWindowThreadProcessId(window, &pid) && pid == process.dwProcessId) break;
-        window = nullptr;
-        if (WaitForSingleObject(process.hProcess, 50) != WAIT_TIMEOUT) break;
-    }
-    bool passed = window && !IsWindowVisible(window);
-    if (passed) {
-        PROCESS_INFORMATION duplicate{};
-        if (Launch(app, folder, duplicate)) {
-            passed = ExitedSuccessfully(duplicate.hProcess, 5000);
-            if (!passed) TerminateProcess(duplicate.hProcess, 1);
-            CloseHandle(duplicate.hProcess);
-        } else {
-            passed = false;
-        }
-    }
-    if (window) {
-        // Close an open tray menu before closing the controller.
-        PostMessageW(window, WM_CANCELMODE, 0, 0);
-        PostMessageW(window, WM_CLOSE, 0, 0);
-    }
-    if (!ExitedSuccessfully(process.hProcess, 5000)) {
-        TerminateProcess(process.hProcess, 1);
-        passed = false;
-    }
-    CloseHandle(process.hProcess);
-    return passed;
-}
-
-int main(int argc, char**) {
+int main() {
     const auto folder = fs::temp_directory_path() /
         (L"on-this-day Windows test " + std::to_wstring(GetCurrentProcessId()));
     fs::create_directories(folder);
     bool passed = false;
     int count = 0;
     auto argv = CommandLineToArgvW(GetCommandLineW(), &count);
-    if (argv && count == 3 && std::wstring_view(argv[1]) == L"--gui") {
-        passed = TestGui(argv[2], folder);
-    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--verify") {
-        passed = TestTerminalRefresh(argv[2], folder);
+    if (argv && count == 3 && std::wstring_view(argv[1]) == L"--one-shot") {
+        passed = TestOneShot(argv[2], folder);
     } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {
         passed = TestList(argv[2], argv[3], folder);
     } else if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         if (argv && count == 3 && std::wstring_view(argv[1]) == L"--date-taken") {
             passed = TestDateTaken(argv[2], folder);
-        } else if (argc == 1) {
-            passed = TestPhotoDecoder(folder);
         }
         CoUninitialize();
     }

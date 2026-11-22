@@ -32,12 +32,8 @@ int main() {
         };
         const std::vector expected{folder / "a/nested/metadata.png", folder / "z.JPG"};
         Check(ScanPhotos(folder, {11, 22}, readDate) == expected,
-            "recursive scan, sort, image filter or ItemDate-only matching");
+            "recursive scan, sort, image filter or capture-date-only matching");
         Check(ScanPhotos(folder, {12, 1}, readDate).empty(), "no matches");
-        std::stop_source stop;
-        stop.request_stop();
-        Check(ScanPhotos(folder, {11, 22}, readDate, stop.get_token()).empty(), "cancelled scan");
-
         PhotoRotation rotation;
         rotation.Reset(expected);
         std::vector<fs::path> shown;
@@ -49,6 +45,12 @@ int main() {
         Check(rotation.Advance([&](const fs::path& photo) { return photo == expected[1]; }),
             "skip missing or undecodable photo");
         Check(rotation.Advance(show) && shown.back() == expected[0], "advance after skipping");
+        rotation.Reset(expected, expected[0]);
+        Check(rotation.Advance(show) && shown.back() == expected[1], "resume after a previous launch");
+        rotation.Reset(expected, expected[1]);
+        Check(rotation.Advance(show) && shown.back() == expected[0], "wrap on restart");
+        rotation.Reset(expected, folder / "removed.jpg");
+        Check(rotation.Advance(show) && shown.back() == expected[0], "removed cursor begins at first photo");
         rotation.Reset({});
         Check(!rotation.Advance(show), "empty rotation");
     } catch (const std::exception& error) {
