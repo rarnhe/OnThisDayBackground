@@ -34,11 +34,14 @@ private:
 #ifdef _WIN32
 #include <windows.h>
 #include <string>
+#include <string_view>
 
 namespace on_this_day {
 
 enum class DesktopInterface { unavailable, windows11Initial, windows11Before24H2, windows11Modern };
 DesktopInterface DesktopInterfaceForBuild(unsigned long build);
+
+bool IsExplorerRefreshLabel(std::wstring_view label, std::wstring_view localized = {});
 
 bool IsCurrentDesktopGuid(const GUID& shell, const std::optional<GUID>& registered,
     const std::vector<GUID>& desktops);

@@ -7,7 +7,7 @@ target_compile_features(OnThisDayBackgroundSource PUBLIC cxx_std_20)
 
 if(WIN32)
     target_link_libraries(OnThisDayBackgroundSource PUBLIC
-        advapi32 ole32 propsys runtimeobject shell32 user32 uuid)
+        advapi32 ole32 oleaut32 propsys runtimeobject shell32 uiautomationcore user32 uuid)
     target_compile_definitions(OnThisDayBackgroundSource PUBLIC
         UNICODE _UNICODE NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 

@@ -144,9 +144,18 @@ bool TestResident(const fs::path& app, const fs::path& folder) {
     if (!passed) TerminateProcess(launcher.hProcess, 1);
     CloseHandle(launcher.hProcess);
 
-    DWORD pendingBytes = 0;
-    passed = passed && !PeekNamedPipe(reader.get(), nullptr, 0, nullptr, &pendingBytes, nullptr) &&
-        GetLastError() == ERROR_BROKEN_PIPE;
+    // First launch prints the lookup result before detaching. Read only the
+    // buffered bytes so a leaked writer cannot hang this test.
+    DWORD pendingBytes = 0, readBytes = 0;
+    std::string report;
+    while (PeekNamedPipe(reader.get(), nullptr, 0, nullptr, &pendingBytes, nullptr) && pendingBytes) {
+        std::string buffer(pendingBytes, '\0');
+        if (!ReadFile(reader.get(), buffer.data(), pendingBytes, &readBytes, nullptr) || !readBytes) break;
+        report.append(buffer.data(), readBytes);
+    }
+    passed = passed && !PeekNamedPipe(reader.get(), nullptr, 0, nullptr, nullptr, nullptr) &&
+        GetLastError() == ERROR_BROKEN_PIPE && report.starts_with("System.Photo.DateTaken ") &&
+        report.ends_with("0 matching photo(s)\r\n");
 
     HWND window = findResident();
     DWORD pid = 0;
@@ -172,16 +181,8 @@ bool TestResident(const fs::path& app, const fs::path& folder) {
         passed = exited && after == pid && WaitForSingleObject(worker.get(), 0) == WAIT_TIMEOUT;
     }
 
-    PROCESS_INFORMATION stop{};
-    if (Launch(app, {}, stop, L"--stop")) {
-        const bool exited = ExitedSuccessfully(stop.hProcess, 6000);
-        if (!exited) TerminateProcess(stop.hProcess, 1);
-        CloseHandle(stop.hProcess);
-        passed = passed && exited;
-    } else {
-        passed = false;
-    }
-    if (!ExitedSuccessfully(worker.get(), 1000)) {
+    passed = PostMessageW(window, WM_CLOSE, 0, 0) && passed;
+    if (!ExitedSuccessfully(worker.get(), 5000)) {
         TerminateProcess(worker.get(), 1);
         passed = false;
     }
@@ -213,6 +214,14 @@ bool TestCurrentDesktopGuid() {
         !IsCurrentDesktopGuid(second, second, {first, second, second});
 }
 
+bool TestRefreshNames() {
+    return IsExplorerRefreshLabel(L"R&efresh") &&
+        IsExplorerRefreshLabel(L"\u5237\u65b0(&E)") &&
+        IsExplorerRefreshLabel(L"\u91cd\u65b0\u6574\u7406") &&
+        IsExplorerRefreshLabel(L"Aktualisieren", L"&Aktualisieren") &&
+        !IsExplorerRefreshLabel(L"Refresh all") && !IsExplorerRefreshLabel(L"New");
+}
+
 int main() {
     const auto folder = fs::temp_directory_path() /
         (L"on-this-day Windows test " + std::to_wstring(GetCurrentProcessId()));
@@ -224,6 +233,8 @@ int main() {
         passed = TestDesktopInterfaceFamilies();
     } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--desktop-guid") {
         passed = TestCurrentDesktopGuid();
+    } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--refresh-names") {
+        passed = TestRefreshNames();
     } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--resident") {
         passed = TestResident(argv[2], folder);
     } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {

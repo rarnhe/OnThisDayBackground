@@ -15,11 +15,17 @@
 #include <shobjidl.h>
 #include <winstring.h>
 #include <wrl/client.h>
+#include <wrl/implements.h>
+#include <uiautomation.h>
 
 #include <cwchar>
 #include <memory>
 #include <string_view>
 #include <type_traits>
+#include <cstdint>
+#include <stop_token>
+#include <thread>
+#include <cwchar>
 #endif
 
 namespace on_this_day {
@@ -93,6 +99,22 @@ bool PhotoRotation::Advance(const std::function<bool(const fs::path&)>& display)
 
 namespace on_this_day {
 using Microsoft::WRL::ComPtr;
+
+bool IsExplorerRefreshLabel(std::wstring_view label, std::wstring_view localized) {
+    const auto normalize = [](std::wstring_view text) {
+        std::wstring name(text.substr(0, text.find(L'\t')));
+        std::erase(name, L'&');
+        if (name.size() >= 3 && name[name.size() - 3] == L'(' && name.back() == L')') {
+            name.resize(name.size() - 3);
+        }
+        while (!name.empty() && name.back() == L' ') name.pop_back();
+        return name;
+    };
+    const auto name = normalize(label);
+    return name == L"\u5237\u65b0" || name == L"\u91cd\u65b0\u6574\u7406" ||
+        CompareStringOrdinal(name.c_str(), -1, L"Refresh", -1, TRUE) == CSTR_EQUAL ||
+        (!localized.empty() && name == normalize(localized));
+}
 
 DesktopInterface DesktopInterfaceForBuild(unsigned long build) {
     if (build >= 26100) return DesktopInterface::windows11Modern;
@@ -595,6 +617,92 @@ int ApplyNextWallpaper(PhotoRotation& rotation) {
 constexpr wchar_t kResidentClass[] = L"OnThisDayBackground.Resident";
 constexpr wchar_t kResidentMutex[] = L"Local\\OnThisDayBackground.Resident";
 constexpr UINT kNextWallpaper = WM_APP + 1;
+constexpr UINT kDesktopRefreshInvoked = WM_APP + 2;
+
+std::wstring LocalizedRefreshLabel() {
+    HMODULE shell = LoadLibraryExW(L"shell32.dll", nullptr,
+        LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!shell) return {};
+    wchar_t label[128]{};
+    if (HMENU menu = LoadMenuW(shell, MAKEINTRESOURCEW(215))) {
+        GetMenuStringW(menu, 28931, label, ARRAYSIZE(label), MF_BYCOMMAND);
+        DestroyMenu(menu);
+    }
+    FreeLibrary(shell);
+    return label;
+}
+
+class RefreshEventHandler final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IUIAutomationEventHandler> {
+public:
+    explicit RefreshEventHandler(HWND receiver) : receiver_(receiver), localized_(LocalizedRefreshLabel()) {}
+
+    HRESULT STDMETHODCALLTYPE HandleAutomationEvent(IUIAutomationElement* sender, EVENTID event) override {
+        if (!sender || event != UIA_Invoke_InvokedEventId) return S_OK;
+        CONTROLTYPEID type = 0;
+        int pid = 0;
+        if (FAILED(sender->get_CachedControlType(&type)) || type != UIA_MenuItemControlTypeId ||
+            FAILED(sender->get_CachedProcessId(&pid)) || pid <= 0) return S_OK;
+        BSTR name = nullptr;
+        if (SUCCEEDED(sender->get_CachedName(&name)) && name) {
+            try {
+                if (IsExplorerRefreshLabel({name, SysStringLen(name)}, localized_)) {
+                    PostMessageW(receiver_, kDesktopRefreshInvoked, static_cast<WPARAM>(pid), 0);
+                }
+            } catch (const std::exception&) {
+                SysFreeString(name);
+                return E_FAIL;
+            }
+        }
+        SysFreeString(name);
+        return S_OK;
+    }
+
+private:
+    HWND receiver_;
+    std::wstring localized_;
+};
+
+void WatchExplorerInvocations(HWND window, HANDLE stop) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
+    {
+        ComPtr<IUIAutomation> automation;
+        ComPtr<IUIAutomationElement> root;
+        ComPtr<IUIAutomationCacheRequest> cache;
+        try {
+            if (SUCCEEDED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                    IID_PPV_ARGS(automation.GetAddressOf()))) &&
+                SUCCEEDED(automation->GetRootElement(root.GetAddressOf())) &&
+                SUCCEEDED(automation->CreateCacheRequest(cache.GetAddressOf())) &&
+                SUCCEEDED(cache->AddProperty(UIA_NamePropertyId)) &&
+                SUCCEEDED(cache->AddProperty(UIA_ControlTypePropertyId)) &&
+                SUCCEEDED(cache->AddProperty(UIA_ProcessIdPropertyId))) {
+                const auto handler = Microsoft::WRL::Make<RefreshEventHandler>(window);
+                if (handler && SUCCEEDED(automation->AddAutomationEventHandler(UIA_Invoke_InvokedEventId,
+                        root.Get(), TreeScope_Subtree, cache.Get(), handler.Get()))) {
+                    WaitForSingleObject(stop, INFINITE);
+                    automation->RemoveAutomationEventHandler(UIA_Invoke_InvokedEventId, root.Get(), handler.Get());
+                }
+            }
+        } catch (const std::exception&) {
+            OutputDebugStringW(L"Could not monitor Explorer's Refresh menu item.");
+        }
+    }
+    CoUninitialize();
+}
+
+DWORD ExplorerDesktopAtCursor() {
+    POINT point{};
+    if (!GetCursorPos(&point)) return 0;
+    const HWND root = GetAncestor(WindowFromPoint(point), GA_ROOT);
+    const HWND shell = GetShellWindow();
+    if (!root || !shell) return 0;
+    DWORD pid = 0, shellPid = 0;
+    GetWindowThreadProcessId(root, &pid);
+    GetWindowThreadProcessId(shell, &shellPid);
+    return pid && pid == shellPid && (root == shell ||
+        FindWindowExW(root, nullptr, L"SHELLDLL_DefView", nullptr)) ? pid : 0;
+}
 
 HWND FindResident() {
     return FindWindowExW(HWND_MESSAGE, nullptr, kResidentClass, nullptr);
@@ -605,6 +713,8 @@ struct Resident {
     std::size_t pending = 0;
     bool busy = true;
     bool stopping = false;
+    DWORD desktopMenuPid = 0;
+    ULONGLONG desktopMenuTime = 0;
 };
 
 void ProcessRequests(HWND window, Resident& state) {
@@ -630,6 +740,22 @@ LRESULT CALLBACK ResidentProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     auto* state = reinterpret_cast<Resident*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (state) {
         switch (message) {
+        case WM_INPUT: {
+            RAWINPUT input{};
+            UINT size = sizeof(input);
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &input, &size,
+                    sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+                input.header.dwType == RIM_TYPEMOUSE && (input.data.mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)) {
+                state->desktopMenuPid = ExplorerDesktopAtCursor();
+                state->desktopMenuTime = GetTickCount64();
+            }
+            return DefWindowProcW(window, message, wParam, lParam);
+        }
+        case kDesktopRefreshInvoked:
+            if (!state->desktopMenuPid || wParam != state->desktopMenuPid ||
+                GetTickCount64() - state->desktopMenuTime > 30000) return 0;
+            state->desktopMenuPid = 0;
+            [[fallthrough]];
         case kNextWallpaper:
             ++state->pending;
             ProcessRequests(window, *state);
@@ -646,7 +772,8 @@ LRESULT CALLBACK ResidentProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-int RunResident(HINSTANCE instance, const fs::path& folder) {
+int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
+    std::unique_ptr<void, decltype(&CloseHandle)> report(reportPipe, &CloseHandle);
     HANDLE raw = CreateMutexW(nullptr, TRUE, kResidentMutex);
     const DWORD created = GetLastError();
     const std::unique_ptr<void, decltype(&CloseHandle)> mutex(raw, &CloseHandle);
@@ -687,7 +814,22 @@ int RunResident(HINSTANCE instance, const fs::path& folder) {
         ReportFailure(nullptr, L"Could not start the background message window.", false);
     } else {
         try {
-            state.rotation.Reset(ScanPhotos(folder, Today(), ReadDateTaken));
+            const auto date = Today();
+            auto photos = ScanPhotos(folder, date, ReadDateTaken);
+            if (report) PrintMatches(report.get(), date, photos);
+            report.reset();
+            state.rotation.Reset(std::move(photos));
+
+            const RAWINPUTDEVICE mouse{0x01, 0x02, RIDEV_INPUTSINK, window};
+            const std::unique_ptr<void, decltype(&CloseHandle)> stop(
+                CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle);
+            std::jthread watcher;
+            if (stop && RegisterRawInputDevices(&mouse, 1, sizeof(mouse))) {
+                watcher = std::jthread([window, signal = stop.get()](std::stop_token token) {
+                    const std::stop_callback wake(token, [signal] { SetEvent(signal); });
+                    WatchExplorerInvocations(window, signal);
+                });
+            }
             state.busy = false;
             ProcessRequests(window, state);
             MSG message{};
@@ -715,49 +857,79 @@ std::wstring QuotePath(const fs::path& path) {
     return quoted;
 }
 
-int StartResident(const fs::path& folder) {
+void PrintResidentReport(HANDLE pipe, HANDLE output) {
+    char buffer[4096]{};
+    std::string pending;
+    DWORD read = 0;
+    while (ReadFile(pipe, buffer, sizeof(buffer), &read, nullptr) && read) {
+        if (!output) continue;
+        pending.append(buffer, read);
+        std::size_t begin = 0;
+        for (auto end = pending.find('\n'); end != std::string::npos; end = pending.find('\n', begin)) {
+            const auto length = static_cast<int>(end + 1 - begin);
+            const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pending.data() + begin,
+                length, nullptr, 0);
+            if (size > 0) {
+                std::wstring line(size, L'\0');
+                if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pending.data() + begin,
+                        length, line.data(), size)) WriteOutput(output, line);
+            }
+            begin = end + 1;
+        }
+        pending.erase(0, begin);
+    }
+}
+
+int StartResident(const fs::path& folder, HANDLE output) {
     std::wstring executable(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
     if (length == 0 || length >= executable.size()) {
         return ReportFailure(nullptr, L"Could not locate OnThisDayBackground.exe.", false);
     }
     executable.resize(length);
-    auto command = QuotePath(executable) + L" --resident " + QuotePath(folder);
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
+    HANDLE rawRead = nullptr, rawWrite = nullptr;
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    if (!CreatePipe(&rawRead, &rawWrite, &security, 0)) {
+        return ReportFailure(output, L"Could not open the scan report pipe.", false);
+    }
+    const std::unique_ptr<void, decltype(&CloseHandle)> read(rawRead, &CloseHandle);
+    std::unique_ptr<void, decltype(&CloseHandle)> write(rawWrite, &CloseHandle);
+    auto command = QuotePath(executable) + L" --resident " + QuotePath(folder) + L" " +
+        std::to_wstring(reinterpret_cast<UINT_PTR>(rawWrite));
+
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    auto storage = std::make_unique<BYTE[]>(size);
+    const auto attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.get());
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &size)) {
+        return ReportFailure(output, L"Could not prepare the background process.", false);
+    }
+    const std::unique_ptr<std::remove_pointer_t<LPPROC_THREAD_ATTRIBUTE_LIST>,
+        decltype(&DeleteProcThreadAttributeList)> cleanup(
+        attributes, &DeleteProcThreadAttributeList);
+    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            &rawWrite, sizeof(rawWrite), nullptr, nullptr)) {
+        return ReportFailure(output, L"Could not pass the scan report pipe to the background process.", false);
+    }
+
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.lpAttributeList = attributes;
     PROCESS_INFORMATION process{};
-    // No inherited console or redirected standard handles are kept by the worker.
-    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS,
-            nullptr, nullptr, &startup, &process)) {
-        return ReportFailure(nullptr, L"Could not start the background process.", false);
+    // The only inherited handle is the temporary scan report pipe.
+    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+            DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &startup.StartupInfo, &process)) {
+        return ReportFailure(output, L"Could not start the background process.", false);
     }
     CloseHandle(process.hThread);
     const std::unique_ptr<void, decltype(&CloseHandle)> worker(process.hProcess, &CloseHandle);
-    const auto deadline = GetTickCount64() + 5000;
-    while (GetTickCount64() < deadline) {
-        if (WaitForSingleObject(worker.get(), 25) == WAIT_OBJECT_0) {
-            DWORD code = 1;
-            return GetExitCodeProcess(worker.get(), &code) ? static_cast<int>(code) : 1;
-        }
-        if (const HWND resident = FindResident()) {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(resident, &pid);
-            if (pid == process.dwProcessId) return 0;
-        }
+    write.reset();
+    PrintResidentReport(read.get(), output);
+    if (WaitForSingleObject(worker.get(), 0) == WAIT_OBJECT_0) {
+        DWORD code = 1;
+        return GetExitCodeProcess(worker.get(), &code) ? static_cast<int>(code) : 1;
     }
     return 0;
-}
-
-int StopResident() {
-    const HWND window = FindResident();
-    if (!window) return 0;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(window, &pid);
-    if (!pid) return 0;
-    const std::unique_ptr<void, decltype(&CloseHandle)> resident(
-        OpenProcess(SYNCHRONIZE, FALSE, pid), &CloseHandle);
-    if (!PostMessageW(window, WM_CLOSE, 0, 0)) return IsWindow(window) ? 1 : 0;
-    return resident && WaitForSingleObject(resident.get(), 5000) == WAIT_OBJECT_0 ? 0 : 1;
 }
 
 int ListPhotos(const fs::path& folder, HANDLE output) {
@@ -786,8 +958,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     if (!argv) return 1;
 
     const std::wstring_view option = argc > 1 ? argv.get()[1] : L"";
-    if (option == L"--resident" && argc == 3) return RunResident(instance, argv.get()[2]);
-    if (option == L"--stop" && argc == 2) return StopResident();
+    if (option == L"--resident" && argc == 4) {
+        wchar_t* end = nullptr;
+        const auto handle = _wcstoui64(argv.get()[3], &end, 10);
+        if (end == argv.get()[3] || *end || !handle || handle > UINTPTR_MAX) return 1;
+        const auto report = reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(handle));
+        if (GetFileType(report) != FILE_TYPE_PIPE) return 1;
+        return RunResident(instance, argv.get()[2], report);
+    }
 
     const bool list = option == L"--list";
     if (!list && argc <= 2) {
@@ -796,14 +974,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
     }
 
-    const HANDLE output = list ? OpenCommandLineOutput() : nullptr;
+    const HANDLE output = OpenCommandLineOutput();
     const int folderIndex = list ? 2 : 1;
     const auto folder = argc <= folderIndex + 1 ?
         ResolveFolder(argc > folderIndex ? argv.get()[folderIndex] : nullptr) : fs::path{};
     if (folder.empty()) {
-        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [--list] [photo folder], or --stop.", list);
+        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [--list] [photo folder].", list);
     }
-    return list ? ListPhotos(folder, output) : StartResident(folder);
+    return list ? ListPhotos(folder, output) : StartResident(folder, output);
 }
 
 #endif // _WIN32
