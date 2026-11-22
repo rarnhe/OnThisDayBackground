@@ -42,6 +42,8 @@ jobs:
 
       - name: Build
         id: build
+        env:
+          _CL_: /analyze /we28251
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log

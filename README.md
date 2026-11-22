@@ -22,6 +22,18 @@ Start-Process -FilePath .\OnThisDayBackground.exe -ArgumentList '--list "D:\Phot
 
 省略目录时使用 Windows「图片」文件夹。重定向标准输出时使用 UTF-8。
 
+## 分开验证壁纸和桌面刷新
+
+先从托盘退出已运行的实例，再用 PowerShell 启动验证模式。PowerShell 等待程序退出，把终端键盘输入留给验证模式。
+
+```powershell
+Start-Process -FilePath .\OnThisDayBackground.exe -ArgumentList '--verify "D:\Photos\FolderA"' -NoNewWindow -Wait
+```
+
+1. 看到 `Verification ready` 和扫描列表后，在终端按 **b**。出现 `[Terminal b] Refresh received.` 表示终端键已触发壁纸流程，无需先聚焦桌面。
+2. 点击 Windows 桌面，再按 **F5**。出现 `[Desktop F5] Refresh received.` 表示桌面刷新已触发相同流程。托盘刷新以 `[Tray]` 标记。
+3. 检查下一行结果和实际主屏。日志会标明照片解码失败、找不到当前虚拟桌面、无法放置 Explorer 背景层，或已更新背景层及照片路径。
+
 ## 架构
 
 | 文件 | 职责 |

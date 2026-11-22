@@ -42,6 +42,8 @@ HBITMAP LoadPhoto(const std::filesystem::path& photo);
 std::optional<std::wstring> CurrentVirtualDesktop();
 bool DesktopHasFocus();
 
+enum class BackgroundResult { applied, photoDecodeFailed, placementFailed };
+
 class DesktopBackground {
 public:
     explicit DesktopBackground(HINSTANCE instance) : instance_(instance) {}
@@ -49,7 +51,7 @@ public:
     DesktopBackground(const DesktopBackground&) = delete;
     DesktopBackground& operator=(const DesktopBackground&) = delete;
 
-    bool Show(const std::filesystem::path& photo);
+    BackgroundResult Show(const std::filesystem::path& photo);
     void Hide();
     void UpdatePlacement();
 

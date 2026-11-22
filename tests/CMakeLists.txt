@@ -11,5 +11,9 @@ if(WIN32)
     add_test(NAME windows_gui_single_instance COMMAND test_windows --gui $<TARGET_FILE:OnThisDayBackground>)
     add_test(NAME windows_cli_photo_list COMMAND test_windows --list $<TARGET_FILE:OnThisDayBackground>
         "${CMAKE_CURRENT_SOURCE_DIR}/filename-2000-08-10.jpg")
-    set_tests_properties(windows_gui_single_instance windows_cli_photo_list PROPERTIES TIMEOUT 20)
+    add_test(NAME windows_terminal_refresh COMMAND test_windows --verify $<TARGET_FILE:OnThisDayBackground>)
+    set_tests_properties(windows_gui_single_instance windows_cli_photo_list windows_terminal_refresh
+        PROPERTIES TIMEOUT 20)
+    set_tests_properties(windows_gui_single_instance windows_terminal_refresh
+        PROPERTIES RESOURCE_LOCK OnThisDayBackgroundController)
 endif()

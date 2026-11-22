@@ -65,9 +65,9 @@ bool IsWindowsGui(const fs::path& program) {
 }
 
 bool Launch(const fs::path& program, const fs::path& folder, PROCESS_INFORMATION& process,
-    bool list = false, HANDLE output = nullptr) {
+    std::wstring_view option = {}, HANDLE output = nullptr) {
     std::wstring command = L"\"" + program.wstring() + L"\"";
-    if (list) command += L" --list";
+    if (!option.empty()) command += L" " + std::wstring(option);
     if (!folder.empty()) command += L" \"" + folder.wstring() + L"\"";
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -119,7 +119,7 @@ bool TestList(const fs::path& app, const fs::path& fixture, const fs::path& fold
     if (raw == INVALID_HANDLE_VALUE) return false;
     std::unique_ptr<void, decltype(&CloseHandle)> output(raw, &CloseHandle);
     PROCESS_INFORMATION process{};
-    if (!Launch(app, photos, process, true, output.get())) return false;
+    if (!Launch(app, photos, process, L"--list", output.get())) return false;
     const bool exited = ExitedSuccessfully(process.hProcess, 5000);
     if (!exited) TerminateProcess(process.hProcess, 1);
     CloseHandle(process.hProcess);
@@ -131,6 +131,61 @@ bool TestList(const fs::path& app, const fs::path& fixture, const fs::path& fold
     const std::string paths(expected.begin(), expected.end());
     return exited && printed.starts_with("System.Photo.DateTaken ") &&
         printed.ends_with("2 matching photo(s)\r\n" + paths);
+}
+
+bool TestTerminalRefresh(const fs::path& app, const fs::path& folder) {
+    // The hosted runner can invoke CTest with redirected stdio and no console.
+    DWORD processIds[1]{};
+    if (!GetConsoleProcessList(processIds, ARRAYSIZE(processIds)) && !AllocConsole()) return false;
+    const auto log = folder / "verify-stdout.txt";
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    const HANDLE rawOutput = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &attributes,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (rawOutput == INVALID_HANDLE_VALUE) return false;
+    const std::unique_ptr<void, decltype(&CloseHandle)> output(rawOutput, &CloseHandle);
+    const HANDLE rawInput = CreateFileW(L"CONIN$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
+    if (rawInput == INVALID_HANDLE_VALUE) return false;
+    const std::unique_ptr<void, decltype(&CloseHandle)> input(rawInput, &CloseHandle);
+    PROCESS_INFORMATION process{};
+    if (!Launch(app, folder, process, L"--verify", output.get())) return false;
+
+    const auto waitForLog = [&](std::string_view message) {
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            std::ifstream file(log, std::ios::binary);
+            const std::string content{std::istreambuf_iterator<char>(file), {}};
+            if (content.find(message) != std::string::npos) return true;
+            if (WaitForSingleObject(process.hProcess, 50) != WAIT_TIMEOUT) break;
+        }
+        return false;
+    };
+
+    bool passed = waitForLog("Verification ready.");
+    if (passed) {
+        INPUT_RECORD events[2]{};
+        events[0].EventType = KEY_EVENT;
+        events[0].Event.KeyEvent.bKeyDown = TRUE;
+        events[0].Event.KeyEvent.wRepeatCount = 1;
+        events[0].Event.KeyEvent.wVirtualKeyCode = 'B';
+        events[0].Event.KeyEvent.uChar.UnicodeChar = L'b';
+        events[1] = events[0];
+        events[1].Event.KeyEvent.bKeyDown = FALSE;
+        DWORD written = 0;
+        passed = WriteConsoleInputW(input.get(), events, ARRAYSIZE(events), &written) &&
+            written == ARRAYSIZE(events) && waitForLog("[Terminal b] Refresh received.");
+    }
+
+    if (const HWND window = FindWindowW(L"OnThisDayBackground.Controller", nullptr)) {
+        DWORD processId = 0;
+        GetWindowThreadProcessId(window, &processId);
+        if (processId == process.dwProcessId) PostMessageW(window, WM_CLOSE, 0, 0);
+    }
+    if (!ExitedSuccessfully(process.hProcess, 3000)) {
+        TerminateProcess(process.hProcess, 1);
+        passed = false;
+    }
+    CloseHandle(process.hProcess);
+    return passed;
 }
 
 bool TestGui(const fs::path& app, const fs::path& folder) {
@@ -178,6 +233,8 @@ int main(int argc, char**) {
     auto argv = CommandLineToArgvW(GetCommandLineW(), &count);
     if (argv && count == 3 && std::wstring_view(argv[1]) == L"--gui") {
         passed = TestGui(argv[2], folder);
+    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--verify") {
+        passed = TestTerminalRefresh(argv[2], folder);
     } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {
         passed = TestList(argv[2], argv[3], folder);
     } else if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
