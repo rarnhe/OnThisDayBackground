@@ -1,6 +1,7 @@
 #include "OnThisDayBackground.h"
 
 #include <shellapi.h>
+#include <cstddef>
 #include <cwchar>
 #include <map>
 #include <objbase.h>
@@ -132,7 +133,8 @@ void Refresh(Controller& state) {
 void OnKeyboardInput(Controller& state, HRAWINPUT handle) {
     RAWINPUT input{};
     UINT size = sizeof(input);
-    if (GetRawInputData(handle, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) != size ||
+    const UINT copied = GetRawInputData(handle, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER));
+    if (copied == static_cast<UINT>(-1) || copied < offsetof(RAWINPUT, data) + sizeof(RAWKEYBOARD) ||
         input.header.dwType != RIM_TYPEKEYBOARD || input.data.keyboard.VKey != VK_F5) return;
     if (input.data.keyboard.Flags & RI_KEY_BREAK) {
         state.f5Down = false;
