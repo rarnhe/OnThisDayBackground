@@ -22,6 +22,7 @@
 #include <memory>
 #include <string_view>
 #include <type_traits>
+#include <mutex>
 #include <cstdint>
 #include <stop_token>
 #include <thread>
@@ -114,6 +115,10 @@ bool IsExplorerRefreshLabel(std::wstring_view label, std::wstring_view localized
     return name == L"\u5237\u65b0" || name == L"\u91cd\u65b0\u6574\u7406" ||
         CompareStringOrdinal(name.c_str(), -1, L"Refresh", -1, TRUE) == CSTR_EQUAL ||
         (!localized.empty() && name == normalize(localized));
+}
+
+bool IsRefreshMenuClick(HWND menu, RECT bounds, HWND pressedWindow, POINT pressedAt, POINT releasedAt) {
+    return menu && pressedWindow == menu && PtInRect(&bounds, pressedAt) && PtInRect(&bounds, releasedAt);
 }
 
 DesktopInterface DesktopInterfaceForBuild(unsigned long build) {
@@ -663,12 +668,174 @@ private:
     std::wstring localized_;
 };
 
-void WatchExplorerInvocations(HWND window, HANDLE stop) {
+struct RefreshMenuHit {
+    HWND window;
+    RECT bounds;
+};
+
+struct DesktopRefreshInput {
+    HWND receiver = nullptr;
+    HANDLE wake = nullptr;
+    std::mutex mutex;
+    DWORD explorerPid = 0;
+    ULONGLONG menuStarted = 0;
+    POINT origin{};
+    HWND pressedWindow = nullptr;
+    POINT pressedAt{};
+    std::optional<RefreshMenuHit> hit;
+};
+
+HWND RootAtPoint(POINT point) {
+    return GetAncestor(WindowFromPoint(point), GA_ROOT);
+}
+
+DWORD WindowProcess(HWND window) {
+    DWORD pid = 0;
+    if (window) GetWindowThreadProcessId(window, &pid);
+    return pid;
+}
+
+DWORD ExplorerDesktopAt(POINT point) {
+    const HWND root = RootAtPoint(point);
+    const HWND shell = GetShellWindow();
+    const DWORD pid = WindowProcess(root);
+    return pid && pid == WindowProcess(shell) && (root == shell ||
+        FindWindowExW(root, nullptr, L"SHELLDLL_DefView", nullptr)) ? pid : 0;
+}
+
+std::optional<RECT> ClassicRefreshBounds(HWND window, std::wstring_view localized) {
+    wchar_t className[32]{};
+    GetClassNameW(window, className, ARRAYSIZE(className));
+    if (std::wstring_view(className) != L"#32768") return std::nullopt;
+
+    DWORD_PTR result = 0;
+    constexpr UINT getMenuHandle = 0x01E1; // MN_GETHMENU
+    if (!SendMessageTimeoutW(window, getMenuHandle, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 80, &result) ||
+        !result) return std::nullopt;
+    const auto menu = reinterpret_cast<HMENU>(result);
+    const int count = GetMenuItemCount(menu);
+    for (int index = 0; index < count; ++index) {
+        const auto state = GetMenuState(menu, index, MF_BYPOSITION);
+        if (state == static_cast<UINT>(-1) || (state & (MF_GRAYED | MF_DISABLED | MF_POPUP))) continue;
+        wchar_t label[128]{};
+        RECT bounds{};
+        if (GetMenuStringW(menu, index, label, ARRAYSIZE(label), MF_BYPOSITION) &&
+            IsExplorerRefreshLabel(label, localized) && GetMenuItemRect(window, menu, index, &bounds) &&
+            !IsRectEmpty(&bounds)) return bounds;
+    }
+    return std::nullopt;
+}
+
+std::optional<RECT> AutomationRefreshItem(IUIAutomationElement& item, DWORD explorerPid,
+    std::wstring_view localized) {
+    int pid = 0;
+    BOOL enabled = FALSE;
+    RECT bounds{};
+    BSTR label = nullptr;
+    if (FAILED(item.get_CurrentProcessId(&pid)) || static_cast<DWORD>(pid) != explorerPid ||
+        FAILED(item.get_CurrentIsEnabled(&enabled)) || !enabled ||
+        FAILED(item.get_CurrentBoundingRectangle(&bounds)) || IsRectEmpty(&bounds) ||
+        FAILED(item.get_CurrentName(&label))) return std::nullopt;
+    const std::unique_ptr<OLECHAR, decltype(&SysFreeString)> name(label, &SysFreeString);
+    if (name && IsExplorerRefreshLabel({name.get(), SysStringLen(name.get())}, localized)) return bounds;
+    return std::nullopt;
+}
+
+std::optional<RECT> AutomationRefreshBounds(IUIAutomation& automation, IUIAutomationCondition& menuItems,
+    POINT point, DWORD explorerPid, std::wstring_view localized) {
+    ComPtr<IUIAutomationElement> element;
+    ComPtr<IUIAutomationTreeWalker> walker;
+    if (FAILED(automation.ElementFromPoint(point, element.GetAddressOf())) ||
+        FAILED(automation.get_ControlViewWalker(walker.GetAddressOf())) || !walker) return std::nullopt;
+
+    for (int depth = 0; element && depth < 8; ++depth) {
+        CONTROLTYPEID type = 0;
+        if (FAILED(element->get_CurrentControlType(&type))) break;
+        if (type == UIA_MenuItemControlTypeId) {
+            if (const auto bounds = AutomationRefreshItem(*element.Get(), explorerPid, localized)) return bounds;
+        } else if (type == UIA_MenuControlTypeId) {
+            ComPtr<IUIAutomationElementArray> items;
+            int count = 0;
+            if (SUCCEEDED(element->FindAll(TreeScope_Descendants, &menuItems, items.GetAddressOf())) &&
+                items && SUCCEEDED(items->get_Length(&count))) {
+                for (int i = 0; i < count; ++i) {
+                    ComPtr<IUIAutomationElement> item;
+                    if (SUCCEEDED(items->GetElement(i, item.GetAddressOf())) && item) {
+                        if (const auto bounds = AutomationRefreshItem(*item.Get(), explorerPid, localized)) {
+                            return bounds;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        ComPtr<IUIAutomationElement> parent;
+        if (FAILED(walker->GetParentElement(element.Get(), parent.GetAddressOf()))) break;
+        element = std::move(parent);
+    }
+    return std::nullopt;
+}
+
+void TrackRefreshMenu(DesktopRefreshInput& input, HANDLE stop, IUIAutomation* automation) {
+    ComPtr<IUIAutomationCondition> menuItems;
+    if (automation) {
+        VARIANT type{};
+        type.vt = VT_I4;
+        type.lVal = UIA_MenuItemControlTypeId;
+        automation->CreatePropertyCondition(UIA_ControlTypePropertyId, type, menuItems.GetAddressOf());
+    }
+    const auto localized = LocalizedRefreshLabel();
+    const HANDLE signals[]{stop, input.wake};
+    DWORD interval = INFINITE;
+    for (;;) {
+        const DWORD wait = WaitForMultipleObjects(ARRAYSIZE(signals), signals, FALSE, interval);
+        if (wait != WAIT_OBJECT_0 + 1 && wait != WAIT_TIMEOUT) return;
+
+        DWORD pid = 0;
+        ULONGLONG started = 0;
+        POINT origin{};
+        {
+            std::lock_guard lock(input.mutex);
+            if (input.explorerPid && GetTickCount64() - input.menuStarted <= 30000) {
+                pid = input.explorerPid;
+                started = input.menuStarted;
+                origin = input.origin;
+            }
+        }
+        interval = pid ? 35 : INFINITE;
+        if (!pid) continue;
+
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) continue;
+        for (const auto point : {cursor, origin}) {
+            const HWND window = RootAtPoint(point);
+            if (WindowProcess(window) != pid) continue;
+            {
+                std::lock_guard lock(input.mutex);
+                if (input.menuStarted == started && input.hit && input.hit->window == window) break;
+            }
+            auto bounds = ClassicRefreshBounds(window, localized);
+            if (!bounds && menuItems) {
+                bounds = AutomationRefreshBounds(*automation, *menuItems.Get(), point, pid, localized);
+            }
+            if (!bounds) continue;
+            std::lock_guard lock(input.mutex);
+            if (input.explorerPid == pid && input.menuStarted == started) {
+                input.hit = RefreshMenuHit{window, *bounds};
+            }
+            break;
+        }
+    }
+}
+
+void WatchExplorerInvocations(DesktopRefreshInput& input, HANDLE stop) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
     {
         ComPtr<IUIAutomation> automation;
         ComPtr<IUIAutomationElement> root;
         ComPtr<IUIAutomationCacheRequest> cache;
+        ComPtr<RefreshEventHandler> handler;
+        bool subscribed = false;
         try {
             if (SUCCEEDED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
                     IID_PPV_ARGS(automation.GetAddressOf()))) &&
@@ -677,31 +844,55 @@ void WatchExplorerInvocations(HWND window, HANDLE stop) {
                 SUCCEEDED(cache->AddProperty(UIA_NamePropertyId)) &&
                 SUCCEEDED(cache->AddProperty(UIA_ControlTypePropertyId)) &&
                 SUCCEEDED(cache->AddProperty(UIA_ProcessIdPropertyId))) {
-                const auto handler = Microsoft::WRL::Make<RefreshEventHandler>(window);
-                if (handler && SUCCEEDED(automation->AddAutomationEventHandler(UIA_Invoke_InvokedEventId,
-                        root.Get(), TreeScope_Subtree, cache.Get(), handler.Get()))) {
-                    WaitForSingleObject(stop, INFINITE);
-                    automation->RemoveAutomationEventHandler(UIA_Invoke_InvokedEventId, root.Get(), handler.Get());
-                }
+                handler = Microsoft::WRL::Make<RefreshEventHandler>(input.receiver);
+                subscribed = handler && SUCCEEDED(automation->AddAutomationEventHandler(UIA_Invoke_InvokedEventId,
+                    root.Get(), TreeScope_Subtree, cache.Get(), handler.Get()));
             }
+            TrackRefreshMenu(input, stop, automation.Get());
         } catch (const std::exception&) {
             OutputDebugStringW(L"Could not monitor Explorer's Refresh menu item.");
         }
+        if (subscribed) automation->RemoveAutomationEventHandler(UIA_Invoke_InvokedEventId, root.Get(), handler.Get());
     }
     CoUninitialize();
 }
 
-DWORD ExplorerDesktopAtCursor() {
-    POINT point{};
-    if (!GetCursorPos(&point)) return 0;
-    const HWND root = GetAncestor(WindowFromPoint(point), GA_ROOT);
-    const HWND shell = GetShellWindow();
-    if (!root || !shell) return 0;
-    DWORD pid = 0, shellPid = 0;
-    GetWindowThreadProcessId(root, &pid);
-    GetWindowThreadProcessId(shell, &shellPid);
-    return pid && pid == shellPid && (root == shell ||
-        FindWindowExW(root, nullptr, L"SHELLDLL_DefView", nullptr)) ? pid : 0;
+thread_local DesktopRefreshInput* mouseInput = nullptr;
+
+LRESULT CALLBACK ObserveDesktopMouse(int code, WPARAM message, LPARAM detail) {
+    if (code == HC_ACTION && mouseInput &&
+        (message == WM_RBUTTONDOWN || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)) {
+        auto& input = *mouseInput;
+        const auto point = reinterpret_cast<const MSLLHOOKSTRUCT*>(detail)->pt;
+        if (message == WM_RBUTTONDOWN) {
+            const auto pid = ExplorerDesktopAt(point);
+            {
+                std::lock_guard lock(input.mutex);
+                input.explorerPid = pid;
+                input.menuStarted = GetTickCount64();
+                input.origin = point;
+                input.hit.reset();
+                input.pressedWindow = nullptr;
+            }
+            SetEvent(input.wake);
+        } else if (message == WM_LBUTTONDOWN) {
+            const HWND window = RootAtPoint(point);
+            std::lock_guard lock(input.mutex);
+            if (input.explorerPid) {
+                input.pressedWindow = window;
+                input.pressedAt = point;
+                SetEvent(input.wake);
+            }
+        } else {
+            std::lock_guard lock(input.mutex);
+            if (input.explorerPid && input.hit && IsRefreshMenuClick(input.hit->window, input.hit->bounds,
+                    input.pressedWindow, input.pressedAt, point)) {
+                PostMessageW(input.receiver, kDesktopRefreshInvoked, input.explorerPid, 0);
+            }
+            input.pressedWindow = nullptr;
+        }
+    }
+    return CallNextHookEx(nullptr, code, message, detail);
 }
 
 HWND FindResident() {
@@ -713,8 +904,7 @@ struct Resident {
     std::size_t pending = 0;
     bool busy = true;
     bool stopping = false;
-    DWORD desktopMenuPid = 0;
-    ULONGLONG desktopMenuTime = 0;
+    DesktopRefreshInput refreshInput;
 };
 
 void ProcessRequests(HWND window, Resident& state) {
@@ -740,22 +930,15 @@ LRESULT CALLBACK ResidentProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     auto* state = reinterpret_cast<Resident*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (state) {
         switch (message) {
-        case WM_INPUT: {
-            RAWINPUT input{};
-            UINT size = sizeof(input);
-            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &input, &size,
-                    sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
-                input.header.dwType == RIM_TYPEMOUSE && (input.data.mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)) {
-                state->desktopMenuPid = ExplorerDesktopAtCursor();
-                state->desktopMenuTime = GetTickCount64();
-            }
-            return DefWindowProcW(window, message, wParam, lParam);
-        }
-        case kDesktopRefreshInvoked:
-            if (!state->desktopMenuPid || wParam != state->desktopMenuPid ||
-                GetTickCount64() - state->desktopMenuTime > 30000) return 0;
-            state->desktopMenuPid = 0;
+        case kDesktopRefreshInvoked: {
+            auto& input = state->refreshInput;
+            std::lock_guard lock(input.mutex);
+            if (!input.explorerPid || wParam != input.explorerPid ||
+                GetTickCount64() - input.menuStarted > 30000) return 0;
+            input.explorerPid = 0;
+            input.hit.reset();
             [[fallthrough]];
+        }
         case kNextWallpaper:
             ++state->pending;
             ProcessRequests(window, *state);
@@ -817,19 +1000,27 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
             const auto date = Today();
             auto photos = ScanPhotos(folder, date, ReadDateTaken);
             if (report) PrintMatches(report.get(), date, photos);
-            report.reset();
             state.rotation.Reset(std::move(photos));
 
-            const RAWINPUTDEVICE mouse{0x01, 0x02, RIDEV_INPUTSINK, window};
             const std::unique_ptr<void, decltype(&CloseHandle)> stop(
                 CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle);
+            const std::unique_ptr<void, decltype(&CloseHandle)> wake(
+                CreateEventW(nullptr, FALSE, FALSE, nullptr), &CloseHandle);
+            auto& input = state.refreshInput;
+            input.receiver = window;
+            input.wake = wake.get();
+            const std::unique_ptr<std::remove_pointer_t<HHOOK>, decltype(&UnhookWindowsHookEx)> hook(
+                stop && wake ? SetWindowsHookExW(WH_MOUSE_LL, ObserveDesktopMouse, instance, 0) : nullptr,
+                &UnhookWindowsHookEx);
             std::jthread watcher;
-            if (stop && RegisterRawInputDevices(&mouse, 1, sizeof(mouse))) {
-                watcher = std::jthread([window, signal = stop.get()](std::stop_token token) {
-                    const std::stop_callback wake(token, [signal] { SetEvent(signal); });
-                    WatchExplorerInvocations(window, signal);
+            if (hook) {
+                mouseInput = &input;
+                watcher = std::jthread([&input, signal = stop.get()](std::stop_token token) {
+                    const std::stop_callback wakeThread(token, [signal] { SetEvent(signal); });
+                    WatchExplorerInvocations(input, signal);
                 });
             }
+            report.reset();
             state.busy = false;
             ProcessRequests(window, state);
             MSG message{};
@@ -838,8 +1029,10 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
+            mouseInput = nullptr;
             if (received == 0) result = static_cast<int>(message.wParam);
         } catch (const std::exception&) {
+            mouseInput = nullptr;
             ReportFailure(nullptr, L"Could not scan the requested photo folder.", false);
         }
         if (IsWindow(window)) DestroyWindow(window);

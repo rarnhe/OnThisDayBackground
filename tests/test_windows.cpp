@@ -222,6 +222,16 @@ bool TestRefreshNames() {
         !IsExplorerRefreshLabel(L"Refresh all") && !IsExplorerRefreshLabel(L"New");
 }
 
+bool TestRefreshHit() {
+    const HWND menu = GetDesktopWindow();
+    const HWND other = HWND_MESSAGE;
+    const RECT bounds{-80, 30, 120, 62};
+    return IsRefreshMenuClick(menu, bounds, menu, {-75, 45}, {-74, 46}) &&
+        !IsRefreshMenuClick(menu, bounds, other, {-75, 45}, {-74, 46}) &&
+        !IsRefreshMenuClick(menu, bounds, menu, {-81, 45}, {-74, 46}) &&
+        !IsRefreshMenuClick(menu, bounds, menu, {-75, 45}, {-74, 62});
+}
+
 int main() {
     const auto folder = fs::temp_directory_path() /
         (L"on-this-day Windows test " + std::to_wstring(GetCurrentProcessId()));
@@ -235,6 +245,8 @@ int main() {
         passed = TestCurrentDesktopGuid();
     } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--refresh-names") {
         passed = TestRefreshNames();
+    } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--refresh-hit") {
+        passed = TestRefreshHit();
     } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--resident") {
         passed = TestResident(argv[2], folder);
     } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {

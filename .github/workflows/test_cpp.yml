@@ -37,7 +37,11 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           New-Item -ItemType Directory -Force out/test-logs | Out-Null
-          cmake -S . -B out/test -A ${{ matrix.arch }} -DBUILD_TESTING=ON 2>&1 | Tee-Object out/test-logs/configure.log
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            cmake --preset x64-release 2>&1 | Tee-Object out/test-logs/configure.log
+          } else {
+            cmake -S . -B out/test -A ${{ matrix.arch }} -DBUILD_TESTING=ON 2>&1 | Tee-Object out/test-logs/configure.log
+          }
           exit $LASTEXITCODE
 
       - name: Build
@@ -46,14 +50,22 @@ jobs:
           _CL_: /analyze /we28251
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            cmake --build --preset x64-release --parallel 2>&1 | Tee-Object out/test-logs/build.log
+          } else {
+            cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log
+          }
           exit $LASTEXITCODE
 
       - name: Run CTest
         id: ctest
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            ctest --preset x64-release --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
+          } else {
+            ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
+          }
           exit $LASTEXITCODE
 
       - name: Write Markdown report and Actions summary
@@ -84,6 +96,8 @@ jobs:
             out/test-logs/
             out/test/test-results.xml
             out/test/Testing/Temporary/
+            out/build/x64-release/test-results.xml
+            out/build/x64-release/Testing/Temporary/
 
       - name: Commit x64 report on main
         if: always() && matrix.arch == 'x64' && github.event_name == 'push' && github.ref == 'refs/heads/main'

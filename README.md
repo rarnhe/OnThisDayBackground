@@ -28,9 +28,11 @@ Start-Process -FilePath .\OnThisDayBackground.exe -ArgumentList '--list "D:\Phot
 应用源码集中在 `OnThisDayBackground.cpp` 和 `OnThisDayBackground.h`。在 Windows 上使用 Visual Studio C++ 工具链。
 
 ```powershell
-cmake -S . -B out/test -A x64 -DBUILD_TESTING=ON
-cmake --build out/test --config Release --parallel
-ctest --test-dir out/test -C Release --output-on-failure
+cmake --preset x64-release
+cmake --build --preset x64-release --parallel
+ctest --preset x64-release
 ```
+
+x64 Release 的可执行文件在 `out/build/x64-release/Release/OnThisDayBackground.exe`。
 
 GitHub Actions 验证 x64 和 Win32，并生成 `test_report.md`。实际壁纸效果可先启动后台实例，再在单个或多个虚拟桌面下再次运行 EXE，或右键桌面空白处选择「刷新」验证。使用扩展显示器时，可在单虚拟桌面下检查副屏壁纸。切换虚拟桌面后再次运行，可检查程序是否只更新当前桌面。

@@ -42,6 +42,7 @@ enum class DesktopInterface { unavailable, windows11Initial, windows11Before24H2
 DesktopInterface DesktopInterfaceForBuild(unsigned long build);
 
 bool IsExplorerRefreshLabel(std::wstring_view label, std::wstring_view localized = {});
+bool IsRefreshMenuClick(HWND menu, RECT bounds, HWND pressedWindow, POINT pressedAt, POINT releasedAt);
 
 bool IsCurrentDesktopGuid(const GUID& shell, const std::optional<GUID>& registered,
     const std::vector<GUID>& desktops);
