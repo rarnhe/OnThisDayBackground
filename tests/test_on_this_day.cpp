@@ -1,4 +1,4 @@
-#include "OnThisDayBackground_Core.h"
+#include "OnThisDayBackground.h"
 
 #include <chrono>
 #include <fstream>
@@ -18,23 +18,21 @@ int main() {
     int status = 0;
     try {
         fs::create_directories(folder / "a" / "nested");
-        for (const auto* path : {"z-11-22.JPG", "a/nested/metadata.png", "conflict-11-22.jpg",
-                "a/2019-11-21-b.jpg", "file-11-22.txt", "a/111-22.jpeg"}) {
+        for (const auto* path : {"z.JPG", "a/nested/metadata.png", "conflict-11-22.jpg",
+                "a/2019-11-22-b.jpg", "file-11-22.txt", "a/111-22.jpeg"}) {
             std::ofstream(folder / path).put('x');
         }
         std::error_code ignored;
         fs::create_directory_symlink(folder, folder / "a" / "loop", ignored);
         const auto readDate = [](const fs::path& photo) -> std::optional<MonthDay> {
-            if (photo.stem() == "metadata") return MonthDay{11, 22};
+            if (photo.stem() == "metadata" || photo.stem() == "z" ||
+                photo.stem() == "file-11-22") return MonthDay{11, 22};
             if (photo.stem() == "conflict-11-22") return MonthDay{11, 21};
             return std::nullopt;
         };
-        const std::vector expected{folder / "a/nested/metadata.png", folder / "z-11-22.JPG"};
+        const std::vector expected{folder / "a/nested/metadata.png", folder / "z.JPG"};
         Check(ScanPhotos(folder, {11, 22}, readDate) == expected,
-            "recursive scan, sort, image filter or metadata priority");
-        Check(DateInFilename(L"DSC_2020-02-29") == MonthDay{2, 29}, "leap day");
-        Check(!DateInFilename(L"DSC_02-30"), "invalid month/day");
-        Check(!DateInFilename(L"DSC_111-22"), "numeric boundary");
+            "recursive scan, sort, image filter or ItemDate-only matching");
         Check(ScanPhotos(folder, {12, 1}, readDate).empty(), "no matches");
         std::stop_source stop;
         stop.request_stop();
