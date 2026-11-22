@@ -19,6 +19,7 @@
 #include <cwchar>
 #include <memory>
 #include <string_view>
+#include <type_traits>
 #endif
 
 namespace on_this_day {
@@ -93,6 +94,13 @@ bool PhotoRotation::Advance(const std::function<bool(const fs::path&)>& display)
 
 namespace on_this_day {
 using Microsoft::WRL::ComPtr;
+
+DesktopInterface DesktopInterfaceForBuild(unsigned long build) {
+    if (build >= 26100) return DesktopInterface::windows11Modern;
+    if (build == 22621 || build == 22631) return DesktopInterface::windows11Before24H2;
+    if (build == 22000) return DesktopInterface::windows11Initial;
+    return DesktopInterface::unavailable;
+}
 
 std::optional<MonthDay> ReadDateTaken(const std::filesystem::path& photo) {
     ComPtr<IPropertyStore> store;
@@ -187,6 +195,7 @@ constexpr wchar_t kDesktopKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
 constexpr wchar_t kSettingsKey[] = L"Software\\OnThisDayBackground";
 constexpr wchar_t kLastSelection[] = L"LastSelection";
+constexpr wchar_t kQueryServiceOperation[] = L"QueryService";
 constexpr GUID kImmersiveShell{0xC2F03A33, 0x21F5, 0x47FA,
     {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
 constexpr GUID kDesktopManagerService{0xC5E0CDCA, 0x7B6E, 0x41B2,
@@ -198,6 +207,9 @@ constexpr GUID kManager23H2{0x4970BA3D, 0xFD4E, 0x4647,
 constexpr GUID kManager22H2{0xA3175F2D, 0x239C, 0x4BD2,
     {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}};
 
+constexpr GUID kManager21H2{0xB2F925B9, 0x5A0F, 0x4D2E,
+    {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}};
+
 // Explorer's private ABI changes across releases. Unused declarations preserve
 // the slots before SetDesktopWallpaper and are never called.
 struct DesktopManager : IUnknown {
@@ -205,6 +217,18 @@ struct DesktopManager : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(IUnknown**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDesktops() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SwitchDesktop() = 0;
+};
+
+// Build 22000 includes a monitor argument and does not have
+// GetAllCurrentDesktops, which appeared in a later preview build.
+struct DesktopManager21H2 : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetCount(HMONITOR, UINT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop() = 0;
+    virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(HMONITOR, IUnknown**) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetDesktops() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE SwitchDesktop() = 0;
@@ -225,7 +249,12 @@ struct DesktopWallpaperManager : Base {
     virtual HRESULT STDMETHODCALLTYPE SetDesktopWallpaper(IUnknown*, HSTRING) = 0;
 };
 
-using ApplyWallpaper = std::function<HRESULT(const fs::path&)>;
+struct ApplyResult {
+    HRESULT status;
+    const wchar_t* operation;
+};
+
+using ApplyWallpaper = std::function<ApplyResult(const fs::path&)>;
 
 DWORD WindowsBuild() {
     using QueryVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
@@ -237,64 +266,98 @@ DWORD WindowsBuild() {
     return query && query(&info) == 0 ? info.dwBuildNumber : 0;
 }
 
-template<class Manager>
-HRESULT GetVirtualDesktopWallpaper(IServiceProvider& shell, REFIID iid, UINT& count, ApplyWallpaper& apply) {
-    ComPtr<Manager> manager;
+template<class Base>
+HRESULT GetVirtualDesktopWallpaper(IServiceProvider& shell, REFIID iid, std::optional<DWORD> registeredCount,
+    UINT& count, ApplyWallpaper& apply, const wchar_t*& operation) {
+    ComPtr<DesktopWallpaperManager<Base>> manager;
+    operation = kQueryServiceOperation;
     HRESULT status = shell.QueryService(kDesktopManagerService, iid,
         reinterpret_cast<void**>(manager.GetAddressOf()));
     if (FAILED(status)) return status;
-    status = manager->GetCount(&count);
-    if (FAILED(status) || count <= 1) return status;
+    if (!manager) return E_UNEXPECTED;
 
-    // Query the current desktop at the moment of application, after scanning.
-    apply = [manager](const fs::path& photo) {
-        ComPtr<IUnknown> desktop;
-        const HRESULT status = manager->GetCurrentDesktop(desktop.GetAddressOf());
-        if (FAILED(status) || !desktop) return FAILED(status) ? status : E_UNEXPECTED;
-        HSTRING_HEADER storage{};
+    operation = L"GetCount";
+    if constexpr (std::is_same_v<Base, DesktopManager21H2>) {
+        status = manager->GetCount(nullptr, &count);
+    } else {
+        status = manager->GetCount(&count);
+    }
+    if (FAILED(status)) {
+        const bool countUnsupported = status == E_NOTIMPL || status == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        if (!countUnsupported || !registeredCount || *registeredCount <= 1) return status;
+        count = *registeredCount;
+    }
+    if (count == 1) return S_OK;
+    if (count == 0) return E_UNEXPECTED;
+
+    ComPtr<IUnknown> desktop;
+    operation = L"GetCurrentDesktop";
+    if constexpr (std::is_same_v<Base, DesktopManager21H2>) {
+        status = manager->GetCurrentDesktop(nullptr, desktop.GetAddressOf());
+    } else {
+        status = manager->GetCurrentDesktop(desktop.GetAddressOf());
+    }
+    if (FAILED(status)) return status;
+    if (!desktop) return E_UNEXPECTED;
+
+    apply = [manager, desktop](const fs::path& photo) -> ApplyResult {
         HSTRING path = nullptr;
-        const HRESULT result = WindowsCreateStringReference(photo.c_str(),
-            static_cast<UINT32>(photo.native().size()), &storage, &path);
-        return SUCCEEDED(result) ? manager->SetDesktopWallpaper(desktop.Get(), path) : result;
+        const HRESULT created = WindowsCreateString(photo.c_str(),
+            static_cast<UINT32>(photo.native().size()), &path);
+        if (FAILED(created)) return {created, L"WindowsCreateString"};
+        const HRESULT result = manager->SetDesktopWallpaper(desktop.Get(), path);
+        WindowsDeleteString(path);
+        return {result, L"SetDesktopWallpaper"};
     };
     return S_OK;
 }
 
-HRESULT GetDesktopConfiguration(UINT& count, ApplyWallpaper& apply) {
-    const DWORD build = WindowsBuild();
-    if (build != 26100 && build != 26200 && build != 22621 && build != 22631) {
+HRESULT GetDesktopConfiguration(DWORD build, std::optional<DWORD> registeredCount,
+    UINT& count, ApplyWallpaper& apply, const wchar_t*& operation) {
+    const auto family = DesktopInterfaceForBuild(build);
+    if (family == DesktopInterface::unavailable) {
+        operation = L"Select virtual desktop interface";
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
 
     ComPtr<IServiceProvider> shell;
+    operation = L"CoCreateInstance(ImmersiveShell)";
     const HRESULT status = CoCreateInstance(kImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER,
         IID_PPV_ARGS(shell.GetAddressOf()));
     if (FAILED(status)) return status;
-    if (build == 26100 || build == 26200) {
-        return GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager24H2>>(
-            *shell.Get(), kManager24H2, count, apply);
+
+    if (family == DesktopInterface::windows11Modern) {
+        // New builds can reuse this ABI. Require the matching IID and working
+        // read-only operations before taking the wallpaper setter path.
+        return GetVirtualDesktopWallpaper<DesktopManager24H2>(*shell.Get(),
+            kManager24H2, registeredCount, count, apply, operation);
+    }
+    if (family == DesktopInterface::windows11Initial) {
+        return GetVirtualDesktopWallpaper<DesktopManager21H2>(*shell.Get(),
+            kManager21H2, registeredCount, count, apply, operation);
     }
 
-    HRESULT result = GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager>>(
-        *shell.Get(), kManager23H2, count, apply);
-    if (result == E_NOINTERFACE) {
-        result = GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager>>(
-            *shell.Get(), kManager22H2, count, apply);
+    HRESULT result = GetVirtualDesktopWallpaper<DesktopManager>(*shell.Get(),
+        kManager23H2, registeredCount, count, apply, operation);
+    if (result == E_NOINTERFACE && operation == kQueryServiceOperation) {
+        result = GetVirtualDesktopWallpaper<DesktopManager>(*shell.Get(),
+            kManager22H2, registeredCount, count, apply, operation);
     }
-    if (result == E_NOINTERFACE) {
+    if (result == E_NOINTERFACE && operation == kQueryServiceOperation) {
         // Updated 23H2 also used this IID, before the extra 24H2 slot was added.
-        result = GetVirtualDesktopWallpaper<DesktopWallpaperManager<DesktopManager>>(
-            *shell.Get(), kManager24H2, count, apply);
+        result = GetVirtualDesktopWallpaper<DesktopManager>(*shell.Get(),
+            kManager24H2, registeredCount, count, apply, operation);
     }
     return result;
 }
 
-bool IsSingleDesktopInRegistry() {
+std::optional<DWORD> RegisteredDesktopCount() {
     DWORD bytes = 0;
     const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, kDesktopKey, L"VirtualDesktopIDs",
         RRF_RT_REG_BINARY, nullptr, nullptr, &bytes);
-    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) return true;
-    return status == ERROR_SUCCESS && (bytes == 0 || bytes == sizeof(GUID));
+    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) return 1;
+    if (status != ERROR_SUCCESS || bytes % sizeof(GUID) != 0) return std::nullopt;
+    return std::max(1UL, static_cast<DWORD>(bytes / sizeof(GUID)));
 }
 
 HRESULT GetPrimaryMonitorWallpaper(ApplyWallpaper& apply) {
@@ -319,8 +382,8 @@ HRESULT GetPrimaryMonitorWallpaper(ApplyWallpaper& apply) {
         RECT bounds{};
         if (SUCCEEDED(status) && monitor && wallpaper->GetMonitorRECT(monitor.get(), &bounds) == S_OK &&
             EqualRect(&bounds, &primary.rcMonitor)) {
-            apply = [wallpaper, id = std::wstring(monitor.get())](const fs::path& photo) {
-                return wallpaper->SetWallpaper(id.c_str(), photo.c_str());
+            apply = [wallpaper, id = std::wstring(monitor.get())](const fs::path& photo) -> ApplyResult {
+                return {wallpaper->SetWallpaper(id.c_str(), photo.c_str()), L"IDesktopWallpaper::SetWallpaper"};
             };
             return S_OK;
         }
@@ -373,9 +436,14 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
 
     ApplyWallpaper apply;
     UINT desktops = 0;
-    const HRESULT desktopStatus = GetDesktopConfiguration(desktops, apply);
-    if (!apply && (desktops > 1 || ((FAILED(desktopStatus) || desktops == 0) && !IsSingleDesktopInRegistry()))) {
-        return ReportFailure(output, L"Cannot target the current virtual desktop on this Windows build (" +
+    const DWORD build = WindowsBuild();
+    const wchar_t* operation = L"";
+    const auto registeredDesktops = RegisteredDesktopCount();
+    const HRESULT desktopStatus = GetDesktopConfiguration(build, registeredDesktops, desktops, apply, operation);
+    const bool multipleDesktops = desktops > 1 || (registeredDesktops && *registeredDesktops > 1);
+    if (!apply && (multipleDesktops || (desktops == 0 && !registeredDesktops))) {
+        return ReportFailure(output, L"Cannot target the current virtual desktop. Windows build " +
+            std::to_wstring(build) + L", " + operation + L" (" +
             DescribeError(FAILED(desktopStatus) ? desktopStatus : E_UNEXPECTED) + L").", false);
     }
 
@@ -390,10 +458,13 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
 
     PhotoRotation rotation;
     rotation.Reset(std::move(photos), ReadLastSelection(date));
+    ApplyResult lastFailure{E_FAIL, L"Apply wallpaper"};
     const bool updated = rotation.Advance([&](const fs::path& photo) {
-        const HRESULT status = apply(photo);
-        if (FAILED(status)) {
-            WriteOutput(output, L"Could not apply " + photo.native() + L" (" + DescribeError(status) + L").\r\n");
+        const auto result = apply(photo);
+        if (FAILED(result.status)) {
+            lastFailure = result;
+            WriteOutput(output, std::wstring(result.operation) + L" could not apply " + photo.native() +
+                L" (Windows build " + std::to_wstring(build) + L", " + DescribeError(result.status) + L").\r\n");
             return false;
         }
         const auto selection = DatePrefix(date) + photo.native();
@@ -406,7 +477,10 @@ int ApplyNextWallpaper(HANDLE output, CalendarDate date, std::vector<fs::path> p
         }
         return true;
     });
-    return updated ? 0 : ReportFailure(output, L"Windows could not apply any matching photo.", false);
+    if (updated) return 0;
+    return ReportFailure(output, L"Windows could not apply any matching photo. Windows build " +
+        std::to_wstring(build) + L", " + lastFailure.operation + L" (" +
+        DescribeError(lastFailure.status) + L").", false);
 }
 } // namespace
 

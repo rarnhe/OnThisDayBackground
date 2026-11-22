@@ -7,6 +7,7 @@ if(WIN32)
     target_link_libraries(test_windows PRIVATE OnThisDayBackgroundSource)
     add_test(NAME windows_date_taken COMMAND test_windows --date-taken
         "${CMAKE_CURRENT_SOURCE_DIR}/filename-2000-08-10.jpg")
+    add_test(NAME windows_desktop_interfaces COMMAND test_windows --desktop-interfaces)
     add_test(NAME windows_gui_one_shot COMMAND test_windows --one-shot $<TARGET_FILE:OnThisDayBackground>)
     add_test(NAME windows_cli_photo_list COMMAND test_windows --list $<TARGET_FILE:OnThisDayBackground>
         "${CMAKE_CURRENT_SOURCE_DIR}/filename-2000-08-10.jpg")

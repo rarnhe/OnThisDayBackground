@@ -36,6 +36,9 @@ private:
 
 namespace on_this_day {
 
+enum class DesktopInterface { unavailable, windows11Initial, windows11Before24H2, windows11Modern };
+DesktopInterface DesktopInterfaceForBuild(unsigned long build);
+
 std::optional<MonthDay> ReadDateTaken(const std::filesystem::path& photo);
 
 } // namespace on_this_day

@@ -137,6 +137,18 @@ bool TestOneShot(const fs::path& app, const fs::path& folder) {
     return true;
 }
 
+bool TestDesktopInterfaceFamilies() {
+    return DesktopInterfaceForBuild(0) == DesktopInterface::unavailable &&
+        DesktopInterfaceForBuild(19045) == DesktopInterface::unavailable &&
+        DesktopInterfaceForBuild(22000) == DesktopInterface::windows11Initial &&
+        DesktopInterfaceForBuild(22621) == DesktopInterface::windows11Before24H2 &&
+        DesktopInterfaceForBuild(22631) == DesktopInterface::windows11Before24H2 &&
+        DesktopInterfaceForBuild(26100) == DesktopInterface::windows11Modern &&
+        DesktopInterfaceForBuild(26200) == DesktopInterface::windows11Modern &&
+        DesktopInterfaceForBuild(26300) == DesktopInterface::windows11Modern &&
+        DesktopInterfaceForBuild(28000) == DesktopInterface::windows11Modern;
+}
+
 int main() {
     const auto folder = fs::temp_directory_path() /
         (L"on-this-day Windows test " + std::to_wstring(GetCurrentProcessId()));
@@ -144,7 +156,9 @@ int main() {
     bool passed = false;
     int count = 0;
     auto argv = CommandLineToArgvW(GetCommandLineW(), &count);
-    if (argv && count == 3 && std::wstring_view(argv[1]) == L"--one-shot") {
+    if (argv && count == 2 && std::wstring_view(argv[1]) == L"--desktop-interfaces") {
+        passed = TestDesktopInterfaceFamilies();
+    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--one-shot") {
         passed = TestOneShot(argv[2], folder);
     } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {
         passed = TestList(argv[2], argv[3], folder);
