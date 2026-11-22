@@ -49,19 +49,25 @@ jobs:
             if (!$value) { throw "Developer environment did not define $name" }
             Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value"
           }
-          Get-Command clang-cl, lld-link, ninja | Select-Object Name, Source
+          Get-Command ninja | Select-Object Name, Source
 
       - name: Configure
         id: configure
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           New-Item -ItemType Directory -Force out/test-logs | Out-Null
+          $env:Path = ($env:Path -split ';' | Where-Object {
+            $_ -and !(Test-Path (Join-Path $_ 'clang-cl.exe')) -and !(Test-Path (Join-Path $_ 'lld-link.exe'))
+          }) -join ';'
+          if (Get-Command clang-cl, lld-link -ErrorAction SilentlyContinue) {
+            throw 'LLVM executables are still in PATH; this build must test toolchain discovery'
+          }
           if ('${{ matrix.arch }}' -eq 'x64') {
             cmake --preset x64-release 2>&1 | Tee-Object out/test-logs/configure.log
           } else {
             cmake -S . -B out/test -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON `
-              -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_CXX_COMPILER_TARGET=i686-pc-windows-msvc `
-              -DCMAKE_LINKER=lld-link 2>&1 | Tee-Object out/test-logs/configure.log
+              -DCMAKE_TOOLCHAIN_FILE=cmake/WindowsLLVM.cmake `
+              -DCMAKE_CXX_COMPILER_TARGET=i686-pc-windows-msvc 2>&1 | Tee-Object out/test-logs/configure.log
           }
           exit $LASTEXITCODE
 
