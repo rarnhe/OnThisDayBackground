@@ -65,8 +65,9 @@ jobs:
           if ('${{ matrix.arch }}' -eq 'x64') {
             cmake --preset x64-release 2>&1 | Tee-Object out/test-logs/configure.log
           } else {
+            $toolchain = Join-Path $PWD.Path 'cmake/WindowsLLVM.cmake'
             cmake -S . -B out/test -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON `
-              -DCMAKE_TOOLCHAIN_FILE=cmake/WindowsLLVM.cmake `
+              "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
               -DCMAKE_CXX_COMPILER_TARGET=i686-pc-windows-msvc 2>&1 | Tee-Object out/test-logs/configure.log
           }
           exit $LASTEXITCODE
