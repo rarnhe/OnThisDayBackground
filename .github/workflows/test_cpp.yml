@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Load Windows SDK and LLVM build environment
+      - name: Load Visual Studio MSVC build environment
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
           $vs = & $vswhere -latest -products '*' -property installationPath
@@ -49,31 +49,25 @@ jobs:
             if (!$value) { throw "Developer environment did not define $name" }
             Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value"
           }
-          Get-Command ninja | Select-Object Name, Source
+          Get-Command cl.exe, link.exe, ninja | Select-Object Name, Source
 
       - name: Configure
         id: configure
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           New-Item -ItemType Directory -Force out/test-logs | Out-Null
-          $env:Path = ($env:Path -split ';' | Where-Object {
-            $_ -and !(Test-Path (Join-Path $_ 'clang-cl.exe')) -and !(Test-Path (Join-Path $_ 'lld-link.exe'))
-          }) -join ';'
-          if (Get-Command clang-cl, lld-link -ErrorAction SilentlyContinue) {
-            throw 'LLVM executables are still in PATH; this build must test toolchain discovery'
-          }
           if ('${{ matrix.arch }}' -eq 'x64') {
             cmake --preset x64-release 2>&1 | Tee-Object out/test-logs/configure.log
           } else {
-            $toolchain = Join-Path $PWD.Path 'cmake/WindowsLLVM.cmake'
             cmake -S . -B out/test -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON `
-              "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
-              -DCMAKE_CXX_COMPILER_TARGET=i686-pc-windows-msvc 2>&1 | Tee-Object out/test-logs/configure.log
+              -DCMAKE_CXX_COMPILER=cl.exe 2>&1 | Tee-Object out/test-logs/configure.log
           }
           exit $LASTEXITCODE
 
       - name: Build
         id: build
+        env:
+          _CL_: /analyze /we28251
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           if ('${{ matrix.arch }}' -eq 'x64') {

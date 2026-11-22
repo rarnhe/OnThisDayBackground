@@ -25,9 +25,9 @@ Start-Process -FilePath .\OnThisDayBackground.exe -ArgumentList '--list "D:\Phot
 
 ## 构建与验证
 
-应用源码集中在 `OnThisDayBackground.cpp` 和 `OnThisDayBackground.h`。使用 Visual Studio 打开包含 `CMakeLists.txt` 的文件夹并选择 `x64-release`。预设通过 Ninja 调用 LLVM 的 `clang-cl` 和 `lld-link`，使用 Windows SDK 以及适配 Windows ABI 的 C++ 头文件和运行库。可以在 Visual Studio Installer 的「使用 C++ 的桌面开发」工作负载下添加「适用于 Windows 的 C++ Clang 工具」。
+应用源码集中在 `OnThisDayBackground.cpp` 和 `OnThisDayBackground.h`。在 Visual Studio 中通过「打开文件夹」打开包含 `CMakeLists.txt` 的项目根目录，选择 `x64-release` 后构建。该预设使用 Ninja 和 MSVC 的 `cl.exe`，由 Visual Studio 设置 x64 编译环境。Visual Studio Installer 中需要安装「使用 C++ 的桌面开发」、MSVC x64/x86 生成工具和 Windows SDK。
 
-CMake 会在 Visual Studio 安装目录及独立 LLVM 安装目录中查找编译器和链接器。自定义安装可以通过 `LLVM_ROOT` 指定安装根目录，无需修改全局 `PATH`。从旧预设切换时，在 Visual Studio 中删除 CMake 缓存并重新配置。
+如果之前配置过本项目，请在 Visual Studio 中删除 CMake 缓存并重新配置。
 
 在命令行构建时，从 Visual Studio 的 x64 Developer Command Prompt 或 Developer PowerShell 执行以下命令。
 

@@ -10,7 +10,6 @@
         "strategy": "external"
       },
       "binaryDir": "${sourceDir}/out/build/x64-release",
-      "toolchainFile": "${sourceDir}/cmake/WindowsLLVM.cmake",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -19,7 +18,7 @@
       "cacheVariables": {
         "BUILD_TESTING": true,
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_COMPILER_TARGET": "x86_64-pc-windows-msvc"
+        "CMAKE_CXX_COMPILER": "cl.exe"
       }
     }
   ],
