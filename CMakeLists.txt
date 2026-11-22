@@ -1,21 +1,26 @@
-﻿# CMakeList.txt: OnThisDayBackground 的 CMake 项目，在此处包括源代码并定义
-# 项目特定的逻辑。
-#
-cmake_minimum_required (VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
+project(OnThisDayBackground LANGUAGES CXX)
 
-# 如果支持，请为 MSVC 编译器启用热重载。
-if (POLICY CMP0141)
-  cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+add_library(OnThisDayBackgroundCore STATIC OnThisDayBackground_Core.cpp)
+target_include_directories(OnThisDayBackgroundCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(OnThisDayBackgroundCore PUBLIC cxx_std_20)
+
+if(WIN32)
+    add_library(OnThisDayBackgroundWindows STATIC
+        OnThisDayBackground_Photos.cpp OnThisDayBackground_Desktop.cpp)
+    target_link_libraries(OnThisDayBackgroundWindows PUBLIC OnThisDayBackgroundCore
+        advapi32 gdi32 ole32 propsys shell32 user32 uuid windowscodecs)
+    target_compile_definitions(OnThisDayBackgroundWindows PUBLIC
+        UNICODE _UNICODE NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+
+    add_executable(OnThisDayBackground WIN32 OnThisDayBackground.cpp)
+    target_link_libraries(OnThisDayBackground PRIVATE OnThisDayBackgroundWindows)
+    if(MINGW)
+        target_link_options(OnThisDayBackground PRIVATE -municode)
+    endif()
 endif()
 
-project ("OnThisDayBackground")
-
-# 将源代码添加到此项目的可执行文件。
-add_executable (OnThisDayBackground "OnThisDayBackground.cpp" "OnThisDayBackground.h")
-
-if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET OnThisDayBackground PROPERTY CXX_STANDARD 20)
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
 endif()
-
-# TODO: 如有需要，请添加测试并安装目标。

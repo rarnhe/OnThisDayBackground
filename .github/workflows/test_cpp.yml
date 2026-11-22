@@ -1,0 +1,101 @@
+name: C++ Windows Tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: [test_report.md]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpp-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.arch }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, Win32]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        id: configure
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory -Force out/test-logs | Out-Null
+          cmake -S . -B out/test -A ${{ matrix.arch }} -DBUILD_TESTING=ON 2>&1 | Tee-Object out/test-logs/configure.log
+          exit $LASTEXITCODE
+
+      - name: Build
+        id: build
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log
+          exit $LASTEXITCODE
+
+      - name: Run CTest
+        id: ctest
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          ctest --test-dir out/test -C Release --output-on-failure --no-tests=error --output-junit test-results.xml 2>&1 | Tee-Object out/test-logs/ctest.log
+          exit $LASTEXITCODE
+
+      - name: Write Markdown report and Actions summary
+        if: always()
+        env:
+          CONFIGURE_OUTCOME: ${{ steps.configure.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          CTEST_OUTCOME: ${{ steps.ctest.outcome }}
+          TEST_ARCH: ${{ matrix.arch }}
+        run: |
+          try {
+            ./tests/write_report.ps1
+          } catch {
+            "# OnThisDayBackground Windows tests", "", "**Report generation failed**", "",
+            "Configure: $env:CONFIGURE_OUTCOME / Build: $env:BUILD_OUTCOME / CTest: $env:CTEST_OUTCOME",
+            "", ($_ | Out-String) | Set-Content -LiteralPath test_report.md -Encoding utf8
+          }
+          Get-Content -Raw -LiteralPath test_report.md | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload report and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            test_report.md
+            out/test-logs/
+            out/test/test-results.xml
+            out/test/Testing/Temporary/
+
+      - name: Commit x64 report on main
+        if: always() && matrix.arch == 'x64' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if (!(Test-Path -LiteralPath test_report.md)) { throw 'Report missing' }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- test_report.md
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 1) {
+            git commit -m "docs: update Windows test report [skip ci]"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git push origin HEAD:main
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }

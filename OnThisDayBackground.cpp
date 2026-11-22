@@ -1,203 +1,291 @@
-﻿//#include <windows.h>
-//#include <shobjidl.h>
-//#include <wrl/client.h>
-//#include <iostream>
-//#include <string>
-//#include <filesystem>
-//#include <ctime>
-//
-//#pragma comment(lib, "Rpcrt4.lib")
-//#pragma comment(lib, "Shlwapi.lib")
-//
-//namespace fs = std::filesystem;
-//using Microsoft::WRL::ComPtr;
-//
-//// --- 1. 获取当前桌面 GUID (保持你的逻辑) ---
-//std::wstring GetCurrentDesktopGuidString() {
-//    HKEY hKey;
-//    BYTE guid[16];
-//    DWORD size = sizeof(guid);
-//    std::wstring result = L"";
-//    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-//        if (RegQueryValueExW(hKey, L"CurrentVirtualDesktop", NULL, NULL, guid, &size) == ERROR_SUCCESS) {
-//            RPC_WSTR guidStr;
-//            if (UuidToStringW((UUID*)guid, &guidStr) == RPC_S_OK) {
-//                result = L"{" + std::wstring((wchar_t*)guidStr) + L"}";
-//                RpcStringFreeW(&guidStr);
-//            }
-//        }
-//        RegCloseKey(hKey);
-//    }
-//    return result;
-//}
-//
-//// --- 2. 核心改进：无闪烁设置壁纸 ---
-//BOOL SetWallpaperSmooth(const std::wstring& imagePath) {
-//    // A. 物理写入注册表：确保下次重启或切换回来时正确
-//    std::wstring desktopGuid = GetCurrentDesktopGuidString();
-//    if (!desktopGuid.empty()) {
-//        std::wstring regPath = L"Control Panel\\Desktop\\VirtualDesktopBackgrounds\\" + desktopGuid;
-//        HKEY hKey;
-//        if (RegCreateKeyExW(HKEY_CURRENT_USER, regPath.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-//            RegSetValueExW(hKey, L"BackgroundImage", 0, REG_SZ, (const BYTE*)imagePath.c_str(), (DWORD)(imagePath.length() + 1) * sizeof(wchar_t));
-//            RegCloseKey(hKey);
-//        }
-//    }
-//
-//    // B. 使用 IDesktopWallpaper 实现平滑过渡 (不闪烁的关键)
-//    // 这种方法会触发系统原生的 Cross-Fade 动画
-//    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-//    BOOL success = FALSE;
-//    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
-//        ComPtr<IDesktopWallpaper> pDesktopWallpaper;
-//        hr = CoCreateInstance(CLSID_DesktopWallpaper, NULL, CLSCTX_ALL, IID_PPV_ARGS(&pDesktopWallpaper));
-//        if (SUCCEEDED(hr)) {
-//            // 参数1为 NULL 表示所有监视器，或者指定 MonitorID
-//            // 这种调用不会触发 SPI_SENDWININICHANGE 的那种暴力重绘
-//            hr = pDesktopWallpaper->SetWallpaper(NULL, imagePath.c_str());
-//            success = SUCCEEDED(hr);
-//        }
-//        CoUninitialize();
-//    }
-//    return success;
-//}
-//
-//// --- 3. 查找逻辑 (保持不变) ---
-//std::wstring FindHistoryTodayImage(const std::wstring& folderPath) {
-//    time_t now = time(0);
-//    tm ltm; localtime_s(&ltm, &now);
-//    wchar_t dateStr[10];
-//    swprintf_s(dateStr, L"%02d-%02d", ltm.tm_mon + 1, ltm.tm_mday);
-//    try {
-//        if (!fs::exists(folderPath)) return L"";
-//        for (const auto& entry : fs::directory_iterator(folderPath)) {
-//            if (entry.is_regular_file() && entry.path().filename().wstring().find(dateStr) != std::wstring::npos) {
-//                return entry.path().wstring();
-//            }
-//        }
-//    }
-//    catch (...) {}
-//    return L"";
-//}
-//
-//int main() {
-//    setlocale(LC_ALL, "");
-//    std::wstring photoFolder = L"C:\\Users\\" + std::wstring(_wgetenv(L"USERNAME")) + L"\\Pictures";
-//    std::wstring targetImage = FindHistoryTodayImage(photoFolder);
-//
-//    if (!targetImage.empty()) {
-//        std::wcout << L"正在平滑更新壁纸: " << targetImage << std::endl;
-//        if (SetWallpaperSmooth(targetImage)) {
-//            std::wcout << L"设置成功，渐变更新中。" << std::endl;
-//        }
-//        else {
-//            std::wcout << L"设置失败。" << std::endl;
-//        }
-//    }
-//    return 0;
-//}
+#include "OnThisDayBackground.h"
 
-#include <windows.h>
-#include <shobjidl.h>
-#include <wrl/client.h>
-#include <iostream>
-#include <vector>
-#include <filesystem>
-#include <string>
+#include <shellapi.h>
+#include <cwchar>
+#include <map>
+#include <objbase.h>
+#include <memory>
+#include <thread>
+#include <utility>
 
-#pragma comment(lib, "user32.lib")
-
+namespace {
+using namespace on_this_day;
 namespace fs = std::filesystem;
-using Microsoft::WRL::ComPtr;
 
-// 全局变量
-std::vector<std::wstring> g_historyImages;
-size_t g_currentIndex = 0;
-bool g_isCurrentlyOnDesktop = false;
+constexpr wchar_t kControllerClass[] = L"OnThisDayBackground.Controller";
+constexpr wchar_t kMutexName[] = L"Local\\OnThisDayBackground";
+constexpr UINT kRefresh = WM_APP + 1;
+constexpr UINT kScanComplete = WM_APP + 2;
+constexpr UINT kTray = WM_APP + 3;
+constexpr UINT kShowMenu = WM_APP + 4;
+constexpr UINT_PTR kTick = 1;
 
-// --- 1. 壁纸切换逻辑 ---
-void ApplyNextWallpaper() {
-    if (g_historyImages.empty()) return;
+struct CalendarDate {
+    unsigned year;
+    MonthDay monthDay;
+    bool operator==(const CalendarDate&) const = default;
+};
 
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
-        ComPtr<IDesktopWallpaper> pDesktopWallpaper;
-        if (SUCCEEDED(CoCreateInstance(CLSID_DesktopWallpaper, NULL, CLSCTX_ALL, IID_PPV_ARGS(&pDesktopWallpaper)))) {
-            pDesktopWallpaper->SetWallpaper(NULL, g_historyImages[g_currentIndex].c_str());
-            g_currentIndex = (g_currentIndex + 1) % g_historyImages.size();
+CalendarDate Today() {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    return {time.wYear, {time.wMonth, time.wDay}};
+}
+
+struct Controller {
+    Controller(HINSTANCE instance, fs::path directory) :
+        folder(std::move(directory)), background(instance) {}
+
+    fs::path folder;
+    DesktopBackground background;
+    HWND window = nullptr;
+    NOTIFYICONDATAW tray{};
+    UINT taskbarCreated = 0;
+    bool f5Down = false;
+    bool scanning = false;
+    std::vector<std::wstring> pendingRefreshes;
+    CalendarDate date{};
+    PhotoRotation rotation;
+    std::optional<std::wstring> desktop;
+    std::map<std::wstring, fs::path> displayed;
+    std::vector<fs::path> scanned;
+    std::jthread scanner;
+};
+
+void AddTrayIcon(Controller& state) {
+    state.tray.cbSize = sizeof(state.tray);
+    state.tray.hWnd = state.window;
+    state.tray.uID = 1;
+    state.tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    state.tray.uCallbackMessage = kTray;
+    state.tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(state.tray.szTip, L"OnThisDayBackground");
+    Shell_NotifyIconW(NIM_ADD, &state.tray);
+}
+
+void UpdateVirtualDesktop(Controller& state) {
+    auto desktop = CurrentVirtualDesktop();
+    if (desktop == state.desktop) {
+        state.background.UpdatePlacement();
+        return;
+    }
+    state.background.Hide();
+    state.desktop = std::move(desktop);
+    if (state.desktop) {
+        if (const auto saved = state.displayed.find(*state.desktop); saved != state.displayed.end()) {
+            state.background.Show(saved->second);
         }
-        CoUninitialize();
     }
 }
 
-// --- 2. 核心：事件回调函数 ---
-void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
-    if (event == EVENT_SYSTEM_FOREGROUND) {
-        char className[256];
-        GetClassNameA(hwnd, className, sizeof(className));
-        std::string cls(className);
-
-        // 判断当前焦点是否在桌面上
-        bool isDesktop = (cls == "WorkerW" || cls == "Progman");
-
-        if (isDesktop && !g_isCurrentlyOnDesktop) {
-            // 只有当鼠标在右下角区域且“刚进入桌面”时才触发
-            POINT pt;
-            GetCursorPos(&pt);
-            int sw = GetSystemMetrics(SM_CXSCREEN);
-            int sh = GetSystemMetrics(SM_CYSCREEN);
-
-            // 判定点击位置是否在右下角响应区
-            if (pt.x >= (sw - 30) && pt.y >= (sh - 30)) {
-                std::cout << "[事件触发] 检测到显示桌面，更换背景..." << std::endl;
-                ApplyNextWallpaper();
+bool BeginScan(Controller& state, CalendarDate date) {
+    if (state.scanning || state.date == date) return true;
+    try {
+        state.scanner = std::jthread([&state, date](std::stop_token stop) {
+            std::vector<fs::path> result;
+            if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+                try {
+                    result = ScanPhotos(state.folder, date.monthDay, ReadPhotoDate, stop);
+                } catch (const std::exception& error) {
+                    OutputDebugStringA(error.what());
+                }
+                CoUninitialize();
             }
-            g_isCurrentlyOnDesktop = true;
+            state.scanned = std::move(result);
+            PostMessageW(state.window, kScanComplete, 0, 0);
+        });
+    } catch (const std::system_error&) {
+        return false;
+    }
+    state.date = date;
+    state.scanning = true;
+    state.rotation.Reset({});
+    return true;
+}
+
+void RefreshDesktop(Controller& state, const std::wstring& desktop) {
+    UpdateVirtualDesktop(state);
+    state.rotation.Advance([&](const fs::path& photo) {
+        if (state.desktop == desktop) {
+            if (!state.background.Show(photo)) return false;
+        } else {
+            // A refresh queued during the scan still belongs to the desktop that requested it.
+            HBITMAP bitmap = LoadPhoto(photo);
+            if (!bitmap) return false;
+            DeleteObject(bitmap);
         }
-        else if (!isDesktop) {
-            // 焦点离开了桌面（回到了应用窗口）
-            g_isCurrentlyOnDesktop = false;
-        }
+        state.displayed[desktop] = photo;
+        return true;
+    });
+}
+
+void Refresh(Controller& state) {
+    const auto desktop = CurrentVirtualDesktop();
+    if (!desktop || !BeginScan(state, Today())) return;
+    if (state.scanning) {
+        state.pendingRefreshes.push_back(*desktop);
+    } else {
+        RefreshDesktop(state, *desktop);
     }
 }
 
-// --- 3. 图片加载 (保持原有逻辑) ---
-void LoadTodayImages() {
-    std::wstring path = L"C:\\Users\\" + std::wstring(_wgetenv(L"USERNAME")) + L"\\Pictures";
-    time_t now = time(0); tm ltm; localtime_s(&ltm, &now);
-    wchar_t dateStr[10]; swprintf_s(dateStr, L"%02d-%02d", ltm.tm_mon + 1, ltm.tm_mday);
-
-    for (const auto& entry : fs::directory_iterator(path)) {
-        if (entry.is_regular_file() && entry.path().filename().wstring().find(dateStr) != std::wstring::npos) {
-            g_historyImages.push_back(entry.path().wstring());
-        }
+void OnKeyboardInput(Controller& state, HRAWINPUT handle) {
+    RAWINPUT input{};
+    UINT size = sizeof(input);
+    if (GetRawInputData(handle, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) != size ||
+        input.header.dwType != RIM_TYPEKEYBOARD || input.data.keyboard.VKey != VK_F5) return;
+    if (input.data.keyboard.Flags & RI_KEY_BREAK) {
+        state.f5Down = false;
+    } else if (!std::exchange(state.f5Down, true) && !(GetAsyncKeyState(VK_MENU) & 0x8000) &&
+        !(GetAsyncKeyState(VK_CONTROL) & 0x8000) && !(GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
+        !(GetAsyncKeyState(VK_LWIN) & 0x8000) && !(GetAsyncKeyState(VK_RWIN) & 0x8000) &&
+        DesktopHasFocus()) {
+        Refresh(state);
     }
 }
 
-int main() {
-    setlocale(LC_ALL, "");
-    LoadTodayImages();
+void ShowTrayMenu(Controller& state) {
+    const HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, L"Refresh wallpaper");
+    AppendMenuW(menu, MF_STRING, 2, L"Exit");
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    SetForegroundWindow(state.window);
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        cursor.x, cursor.y, 0, state.window, nullptr);
+    PostMessageW(state.window, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    if (command == 1) PostMessageW(state.window, kRefresh, 0, 0);
+    if (command == 2) DestroyWindow(state.window);
+}
 
-    if (g_historyImages.empty()) {
-        std::cout << "未找到今日匹配照片。" << std::endl;
+LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    }
+    auto* state = reinterpret_cast<Controller*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!state) return DefWindowProcW(window, message, wParam, lParam);
+    if (message == state->taskbarCreated && state->taskbarCreated != 0) {
+        AddTrayIcon(*state);
         return 0;
     }
 
-    // 设置全局钩子：监听焦点切换
-    HWINEVENTHOOK hHook = SetWinEventHook(
-        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-        NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT
-    );
+    switch (message) {
+    case kRefresh:
+        Refresh(*state);
+        return 0;
+    case kScanComplete:
+        state->scanner.join();
+        state->scanning = false;
+        state->rotation.Reset(std::move(state->scanned));
+        if (BeginScan(*state, Today()) && !state->scanning) {
+            for (const auto& desktop : state->pendingRefreshes) RefreshDesktop(*state, desktop);
+            state->pendingRefreshes.clear();
+        }
+        return 0;
+    case WM_INPUT:
+        OnKeyboardInput(*state, reinterpret_cast<HRAWINPUT>(lParam));
+        return DefWindowProcW(window, message, wParam, lParam);
+    case WM_TIMER:
+        BeginScan(*state, Today());
+        if (!state->displayed.empty()) UpdateVirtualDesktop(*state);
+        return 0;
+    case kTray:
+        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) ShowTrayMenu(*state);
+        return 0;
+    case kShowMenu:
+        ShowTrayMenu(*state);
+        return 0;
+    case WM_DESTROY:
+        state->scanner.request_stop();
+        KillTimer(window, kTick);
+        Shell_NotifyIconW(NIM_DELETE, &state->tray);
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+}
 
-    std::cout << "已启动高级监听模式。点击右下角试试吧！" << std::endl;
-
-    // 必须有消息循环才能让 WinEventHook 工作
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+int Run(HINSTANCE instance) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    int argc = 0;
+    const std::unique_ptr<wchar_t*, decltype(&LocalFree)> argv(
+        CommandLineToArgvW(GetCommandLineW(), &argc), &LocalFree);
+    std::error_code error;
+    fs::path folder;
+    if (argv && argc == 2) folder = fs::absolute(argv.get()[1], error);
+    if (error || folder.empty() || !fs::is_directory(folder, error)) {
+        MessageBoxW(nullptr, L"Usage: OnThisDayBackground.exe \"path to a photo folder\"",
+            L"OnThisDayBackground", MB_OK | MB_ICONERROR);
+        return 1;
     }
 
-    UnhookWinEvent(hHook);
-    return 0;
+    Controller state{instance, std::move(folder)};
+    state.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    WNDCLASSW windowClass{};
+    windowClass.hInstance = instance;
+    windowClass.lpfnWndProc = ControllerProc;
+    windowClass.lpszClassName = kControllerClass;
+    if (!RegisterClassW(&windowClass)) return 1;
+    state.window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kControllerClass, nullptr, WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, &state);
+    if (!state.window) return 1;
+
+    const RAWINPUTDEVICE keyboard{0x01, 0x06, RIDEV_INPUTSINK, state.window};
+    int result = 1;
+    if (RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard)) &&
+        SetTimer(state.window, kTick, 150, nullptr) && BeginScan(state, Today())) {
+        AddTrayIcon(state);
+        MSG message{};
+        BOOL received;
+        while ((received = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (received == 0) result = static_cast<int>(message.wParam);
+    }
+    if (IsWindow(state.window)) DestroyWindow(state.window);
+    if (state.scanner.joinable()) {
+        state.scanner.request_stop();
+        state.scanner.join();
+    }
+    return result;
+}
+
+int RunSingleInstance(HINSTANCE instance) {
+    HANDLE rawMutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    const DWORD status = GetLastError();
+    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(rawMutex, &CloseHandle);
+    if (!mutex) return 1;
+    if (status == ERROR_ALREADY_EXISTS) {
+        const auto deadline = GetTickCount64() + 5000;
+        for (;;) {
+            const DWORD wait = WaitForSingleObject(mutex.get(), 0);
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) break;
+            if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) return 1;
+            if (const HWND existing = FindWindowW(kControllerClass, nullptr)) {
+                DWORD process = 0;
+                GetWindowThreadProcessId(existing, &process);
+                if (process) AllowSetForegroundWindow(process);
+                if (PostMessageW(existing, kShowMenu, 0, 0)) return 0;
+            }
+            Sleep(25);
+        }
+    }
+
+    int result = 1;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        result = Run(instance);
+        CoUninitialize();
+    }
+    ReleaseMutex(mutex.get());
+    return result;
+}
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
+    return RunSingleInstance(instance);
 }
