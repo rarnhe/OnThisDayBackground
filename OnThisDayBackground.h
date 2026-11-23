@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <map>
 #include <vector>
 
 namespace on_this_day {
@@ -18,6 +19,16 @@ using PhotoDateReader = std::function<std::optional<MonthDay>(const std::filesys
 std::vector<std::filesystem::path> ScanPhotos(const std::filesystem::path& folder,
     MonthDay date, const PhotoDateReader& readDate);
 
+struct DatedPhoto {
+    std::filesystem::path path;
+    MonthDay date;
+};
+
+std::vector<DatedPhoto> ScanDatedPhotos(const std::vector<std::filesystem::path>& folders,
+    const PhotoDateReader& readDate);
+std::vector<DatedPhoto> ScanDatedPhotos(const std::filesystem::path& folder,
+    const PhotoDateReader& readDate);
+
 class PhotoRotation {
 public:
     void Reset(std::vector<std::filesystem::path> photos);
@@ -27,6 +38,19 @@ public:
 private:
     std::vector<std::filesystem::path> photos_;
     std::size_t next_ = 0;
+};
+
+// A is a one-time index of all photos with DateTaken; B is created per month/day
+// only on first use. Each day preserves its own rotation position.
+class DailyPhotoCache {
+public:
+    void Reset(std::vector<DatedPhoto> indexed);
+    std::size_t IndexedCount() const { return indexed_.size(); }
+    std::size_t DayCacheCount() const { return byDay_.size(); }
+    PhotoRotation& ForDay(MonthDay date);
+private:
+    std::vector<DatedPhoto> indexed_;
+    std::map<unsigned, PhotoRotation> byDay_;
 };
 
 } // namespace on_this_day

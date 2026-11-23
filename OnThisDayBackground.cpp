@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cwctype>
+#include <set>
 #include <utility>
 
 #ifdef _WIN32
@@ -76,6 +77,75 @@ std::vector<fs::path> ScanPhotos(const fs::path& folder, MonthDay date,
     }
     std::ranges::sort(matches);
     return matches;
+}
+
+std::vector<DatedPhoto> ScanDatedPhotos(const std::vector<fs::path>& folders,
+    const PhotoDateReader& readDate) {
+    std::vector<DatedPhoto> all;
+    std::vector<fs::path> directories(folders.begin(), folders.end());
+    // Roots can be identical or nested; read each image's Property Store once.
+    std::set<std::wstring> visited;
+    const auto normalizedKey = [](const fs::path& file) {
+        std::wstring key = file.lexically_normal().wstring();
+#ifdef _WIN32
+        std::ranges::transform(key, key.begin(), [](wchar_t c) {
+            return static_cast<wchar_t>(std::towlower(c));
+        });
+#endif
+        return key;
+    };
+    while (!directories.empty()) {
+        auto directory = std::move(directories.back());
+        directories.pop_back();
+        std::error_code error;
+        fs::directory_iterator entry(directory, fs::directory_options::skip_permission_denied, error);
+        const fs::directory_iterator end;
+        for (; !error && entry != end; entry.increment(error)) {
+            std::error_code statusError;
+            const auto status = entry->symlink_status(statusError);
+            if (fs::is_directory(status)) {
+#ifdef _WIN32
+                const DWORD attributes = GetFileAttributesW(entry->path().c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                    directories.push_back(entry->path());
+#else
+                directories.push_back(entry->path());
+#endif
+            } else if (fs::is_regular_file(status) && IsImageExtension(entry->path())) {
+                if (!visited.insert(normalizedKey(entry->path())).second) continue;
+                if (const auto date = readDate(entry->path())) {
+                    if (date->month >= 1 && date->month <= 12 && date->day >= 1 && date->day <= 31)
+                        all.push_back({entry->path(), *date});
+                }
+            }
+        }
+    }
+    std::ranges::sort(all, {}, &DatedPhoto::path);
+    return all;
+}
+
+std::vector<DatedPhoto> ScanDatedPhotos(const fs::path& folder,
+    const PhotoDateReader& readDate) {
+    return ScanDatedPhotos(std::vector<fs::path>{folder}, readDate);
+}
+
+void DailyPhotoCache::Reset(std::vector<DatedPhoto> indexed) {
+    indexed_ = std::move(indexed);
+    byDay_.clear();
+}
+
+PhotoRotation& DailyPhotoCache::ForDay(MonthDay date) {
+    const unsigned key = date.month * 100 + date.day;
+    if (auto it = byDay_.find(key); it != byDay_.end()) return it->second;
+    std::vector<fs::path> matches;
+    for (const auto& photo : indexed_) {
+        if (photo.date == date) matches.push_back(photo.path);
+    }
+    return byDay_.try_emplace(key, PhotoRotation{}).first->second = [&] {
+        PhotoRotation rotation;
+        rotation.Reset(std::move(matches));
+        return rotation;
+    }();
 }
 
 void PhotoRotation::Reset(std::vector<fs::path> photos) {
@@ -191,13 +261,17 @@ bool WriteOutput(HANDLE output, const std::wstring& text) {
         written == static_cast<DWORD>(utf8Size);
 }
 
-bool PrintMatches(HANDLE output, MonthDay date, const std::vector<fs::path>& photos) {
-    wchar_t day[16]{};
-    swprintf_s(day, L"%02u-%02u", date.month, date.day);
-    if (!WriteOutput(output, L"System.Photo.DateTaken " + std::wstring(day) + L": " +
-            std::to_wstring(photos.size()) + L" matching photo(s)\r\n")) return false;
+bool PrintIndex(HANDLE output, MonthDay today, const std::vector<DatedPhoto>& photos) {
+    std::vector<const DatedPhoto*> matches;
     for (const auto& photo : photos) {
-        if (!WriteOutput(output, photo.native() + L"\r\n")) return false;
+        if (photo.date == today) matches.push_back(&photo);
+    }
+    wchar_t day[16]{};
+    swprintf_s(day, L"%02u-%02u", today.month, today.day);
+    if (!WriteOutput(output, L"System.Photo.DateTaken " + std::wstring(day) + L": " +
+            std::to_wstring(matches.size()) + L" matching photo(s)\r\n")) return false;
+    for (const auto* photo : matches) {
+        if (!WriteOutput(output, photo->path.native() + L"\r\n")) return false;
     }
     return true;
 }
@@ -216,6 +290,15 @@ fs::path ResolveFolder(const wchar_t* argument) {
     const auto folder = fs::absolute(argument, error);
     if (!error && fs::is_directory(folder, error)) return folder.lexically_normal();
     return {};
+}
+
+std::vector<fs::path> ScanFolders(const fs::path& extra) {
+    std::vector<fs::path> roots;
+    // Always include the user's Windows Pictures known folder.
+    if (const auto pictures = ResolveFolder(nullptr); !pictures.empty())
+        roots.push_back(pictures);
+    if (!extra.empty()) roots.push_back(extra);
+    return roots;
 }
 
 constexpr wchar_t kDesktopKey[] =
@@ -621,7 +704,6 @@ int ApplyNextWallpaper(PhotoRotation& rotation) {
 }
 constexpr wchar_t kResidentClass[] = L"OnThisDayBackground.Resident";
 constexpr wchar_t kResidentMutex[] = L"Local\\OnThisDayBackground.Resident";
-constexpr UINT kNextWallpaper = WM_APP + 1;
 constexpr UINT kDesktopRefreshInvoked = WM_APP + 2;
 
 std::wstring LocalizedRefreshLabel() {
@@ -900,7 +982,7 @@ HWND FindResident() {
 }
 
 struct Resident {
-    PhotoRotation rotation;
+    DailyPhotoCache photos;
     std::size_t pending = 0;
     bool busy = true;
     bool stopping = false;
@@ -913,7 +995,7 @@ void ProcessRequests(HWND window, Resident& state) {
     while (state.pending && !state.stopping) {
         --state.pending;
         try {
-            ApplyNextWallpaper(state.rotation);
+            ApplyNextWallpaper(state.photos.ForDay(Today()));
         } catch (const std::exception&) {
             ReportFailure(nullptr, L"Could not apply a photo from the cached list.", false);
         }
@@ -937,9 +1019,7 @@ LRESULT CALLBACK ResidentProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                 GetTickCount64() - input.menuStarted > 30000) return 0;
             input.explorerPid = 0;
             input.hit.reset();
-            [[fallthrough]];
         }
-        case kNextWallpaper:
             ++state->pending;
             ProcessRequests(window, *state);
             return 0;
@@ -969,9 +1049,7 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
             if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) {
                 return ReportFailure(nullptr, L"Could not reach the running background instance.", false);
             }
-            if (const HWND resident = FindResident()) {
-                if (PostMessageW(resident, kNextWallpaper, 0, 0)) return 0;
-            }
+            if (FindResident()) return 0;
             Sleep(25);
         }
     }
@@ -997,10 +1075,9 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
         ReportFailure(nullptr, L"Could not start the background message window.", false);
     } else {
         try {
-            const auto date = Today();
-            auto photos = ScanPhotos(folder, date, ReadDateTaken);
-            if (report) PrintMatches(report.get(), date, photos);
-            state.rotation.Reset(std::move(photos));
+            auto photos = ScanDatedPhotos(ScanFolders(folder), ReadDateTaken);
+            if (report) PrintIndex(report.get(), Today(), photos);
+            state.photos.Reset(std::move(photos));
 
             const std::unique_ptr<void, decltype(&CloseHandle)> stop(
                 CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle);
@@ -1073,6 +1150,19 @@ void PrintResidentReport(HANDLE pipe, HANDLE output) {
     }
 }
 
+bool PrintIndependentIndex(const fs::path& folder, HANDLE output) {
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initialized)) return false;
+    bool printed = false;
+    try {
+        printed = PrintIndex(output, Today(), ScanDatedPhotos(ScanFolders(folder), ReadDateTaken));
+    } catch (const std::exception&) {
+        printed = false;
+    }
+    CoUninitialize();
+    return printed;
+}
+
 int StartResident(const fs::path& folder, HANDLE output) {
     std::wstring executable(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
@@ -1125,20 +1215,6 @@ int StartResident(const fs::path& folder, HANDLE output) {
     return 0;
 }
 
-int ListPhotos(const fs::path& folder, HANDLE output) {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-        return ReportFailure(output, L"Could not initialize the Windows shell interfaces.", true);
-    }
-    int result = 1;
-    try {
-        const auto date = Today();
-        result = PrintMatches(output, date, ScanPhotos(folder, date, ReadDateTaken)) ? 0 : 1;
-    } catch (const std::exception&) {
-        result = ReportFailure(output, L"Could not scan the requested photo folder.", true);
-    }
-    CoUninitialize();
-    return result;
-}
 } // namespace
 
 #ifdef _MSC_VER
@@ -1160,21 +1236,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         return RunResident(instance, argv.get()[2], report);
     }
 
-    const bool list = option == L"--list";
-    if (!list && argc <= 2) {
-        if (const HWND resident = FindResident()) {
-            return PostMessageW(resident, kNextWallpaper, 0, 0) ? 0 : 1;
+    const HANDLE output = OpenCommandLineOutput();
+    if (option == L"--list") {
+        return ReportFailure(output, L"--list has been removed. Usage: OnThisDayBackground.exe [photo folder].", true);
+    }
+    if (argc <= 2 && FindResident()) {
+        // A directory argument is an independent query, not a rotation event.
+        // It must never modify the resident A/B caches or trigger wallpaper updates.
+        if (argc == 2) {
+            const auto displayFolder = ResolveFolder(argv.get()[1]);
+            if (displayFolder.empty() || !PrintIndependentIndex(displayFolder, output)) {
+                return ReportFailure(output, L"Could not print photos for the requested folder.", true);
+            }
         }
+        return 0;
     }
 
-    const HANDLE output = OpenCommandLineOutput();
-    const int folderIndex = list ? 2 : 1;
-    const auto folder = argc <= folderIndex + 1 ?
-        ResolveFolder(argc > folderIndex ? argv.get()[folderIndex] : nullptr) : fs::path{};
-    if (folder.empty()) {
-        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [--list] [photo folder].", list);
+    const auto folder = argc <= 2 && argc == 2 ?
+        ResolveFolder(argv.get()[1]) : fs::path{};
+    if (argc > 2 || (argc == 2 && folder.empty()) || ScanFolders(folder).empty()) {
+        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [photo folder].", true);
     }
-    return list ? ListPhotos(folder, output) : StartResident(folder, output);
+    return StartResident(folder, output);
 }
 
 #endif // _WIN32

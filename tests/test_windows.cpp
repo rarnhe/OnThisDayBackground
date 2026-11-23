@@ -79,56 +79,56 @@ bool ExitedSuccessfully(HANDLE process, DWORD timeout) {
         GetExitCodeProcess(process, &code) && code == 0;
 }
 
-bool TestList(const fs::path& app, const fs::path& fixture, const fs::path& folder) {
-    std::ifstream jpeg(fixture, std::ios::binary);
-    std::string bytes{std::istreambuf_iterator<char>(jpeg), {}};
-    constexpr std::string_view original = "2015:10:07 12:00:00";
-    SYSTEMTIME local{};
-    GetLocalTime(&local);
-    char today[20]{};
-    sprintf_s(today, "%04u:%02u:%02u 12:00:00", static_cast<unsigned>(local.wYear),
-        static_cast<unsigned>(local.wMonth), static_cast<unsigned>(local.wDay));
-    auto tag = bytes.find(original);
-    if (tag == std::string::npos) return false;
-    while (tag != std::string::npos) {
-        bytes.replace(tag, original.size(), today);
-        tag = bytes.find(original, tag + original.size());
-    }
-
-    const auto photos = folder / L"photos";
-    fs::create_directory(photos);
-    const auto first = photos / L"a-\u7167\u7247.jpg";
-    const auto second = photos / L"z.jpg";
-    for (const auto& photo : {second, first}) {
-        if (!std::ofstream(photo, std::ios::binary).write(bytes.data(), bytes.size())) return false;
-    }
-
-    const auto log = folder / "stdout.txt";
+bool TestRemovedList(const fs::path& app, const fs::path& folder) {
+    // --list is explicitly rejected and must never spawn a resident process.
+    const auto log = folder / "removed-list.txt";
     SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     const HANDLE raw = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &attributes,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (raw == INVALID_HANDLE_VALUE) return false;
     std::unique_ptr<void, decltype(&CloseHandle)> output(raw, &CloseHandle);
     PROCESS_INFORMATION process{};
-    if (!Launch(app, photos, process, L"--list", output.get())) return false;
-    const bool exited = ExitedSuccessfully(process.hProcess, 5000);
-    if (!exited) TerminateProcess(process.hProcess, 1);
+    if (!Launch(app, folder, process, L"--list", output.get())) return false;
+    DWORD code = 0;
+    const bool terminated = WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process.hProcess, &code);
+    if (!terminated) TerminateProcess(process.hProcess, 1);
     CloseHandle(process.hProcess);
     output.reset();
-
     std::ifstream result(log, std::ios::binary);
     const std::string printed{std::istreambuf_iterator<char>(result), {}};
-    const auto expected = first.u8string() + u8"\r\n" + second.u8string() + u8"\r\n";
-    const std::string paths(expected.begin(), expected.end());
-    return exited && printed.starts_with("System.Photo.DateTaken ") &&
-        printed.find("Updated ") == std::string::npos && printed.ends_with("2 matching photo(s)\r\n" + paths);
+    return terminated && code != 0 && printed.find("--list has been removed") != std::string::npos &&
+        !FindWindowExW(HWND_MESSAGE, nullptr, L"OnThisDayBackground.Resident", nullptr);
 }
 
-bool TestResident(const fs::path& app, const fs::path& folder) {
+bool TestResident(const fs::path& app, const fs::path& folder, const fs::path& fixture) {
     const auto findResident = [] {
         return FindWindowExW(HWND_MESSAGE, nullptr, L"OnThisDayBackground.Resident", nullptr);
     };
     if (!IsWindowsGui(app) || findResident()) return false;
+    // Prepare one photo for today and one dated photo for another day.
+    // A indexes both, while the command line prints only today's matches.
+    std::ifstream fixtureFile(fixture, std::ios::binary);
+    std::string exif{std::istreambuf_iterator<char>(fixtureFile), {}};
+    const std::string original = "2015:10:07 12:00:00";
+    const auto pos = exif.find(original);
+    if (pos == std::string::npos) return false;
+    SYSTEMTIME local{};
+    GetLocalTime(&local);
+    char captureDate[20]{};
+    sprintf_s(captureDate, "%04u:%02u:%02u 12:00:00", static_cast<unsigned>(local.wYear),
+        static_cast<unsigned>(local.wMonth), static_cast<unsigned>(local.wDay));
+    for (auto index = exif.find(original); index != std::string::npos;
+            index = exif.find(original, index + original.size())) {
+        exif.replace(index, original.size(), captureDate);
+    }
+    const auto photo = folder / L"indexed-today.jpg";
+    if (!std::ofstream(photo, std::ios::binary).write(exif.data(), exif.size())) return false;
+    const auto older = folder / L"indexed-other-day.jpg";
+    fs::copy_file(fixture, older, fs::copy_options::overwrite_existing);
+    char todayLabel[6]{};
+    sprintf_s(todayLabel, "%02u-%02u", static_cast<unsigned>(local.wMonth),
+        static_cast<unsigned>(local.wDay));
 
     HANDLE pipeRead = nullptr, pipeWrite = nullptr;
     SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
@@ -154,8 +154,11 @@ bool TestResident(const fs::path& app, const fs::path& folder) {
         report.append(buffer.data(), readBytes);
     }
     passed = passed && !PeekNamedPipe(reader.get(), nullptr, 0, nullptr, nullptr, nullptr) &&
-        GetLastError() == ERROR_BROKEN_PIPE && report.starts_with("System.Photo.DateTaken ") &&
-        report.ends_with("0 matching photo(s)\r\n");
+        GetLastError() == ERROR_BROKEN_PIPE &&
+        report.starts_with(std::string("System.Photo.DateTaken ") + todayLabel +
+            ": 1 matching photo(s)\r\n") &&
+        report.find(photo.string() + "\r\n") != std::string::npos &&
+        report.find(older.string()) == std::string::npos;
 
     HWND window = findResident();
     DWORD pid = 0;
@@ -165,20 +168,30 @@ bool TestResident(const fs::path& app, const fs::path& folder) {
     if (!worker) return false;
     passed = passed && pid != launcher.dwProcessId && !IsWindowVisible(window);
 
+    // An explicit directory launch while the resident exists prints an independent
+    // report and must not recreate the resident or post a wallpaper rotation.
     for (int invocation = 0; passed && invocation < 2; ++invocation) {
-        // An active instance still accepts the trigger when the new argument
-        // names a nonexistent folder. It continues using its original cache.
         PROCESS_INFORMATION trigger{};
-        if (!Launch(app, folder / "missing", trigger)) {
-            passed = false;
-            break;
-        }
+        const auto reportFile = folder / ("query-" + std::to_string(invocation) + ".txt");
+        SECURITY_ATTRIBUTES share{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+        const HANDLE raw = CreateFileW(reportFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+            &share, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (raw == INVALID_HANDLE_VALUE) { passed = false; break; }
+        std::unique_ptr<void, decltype(&CloseHandle)> output(raw, &CloseHandle);
+        if (!Launch(app, folder, trigger, {}, output.get())) { passed = false; break; }
         const bool exited = ExitedSuccessfully(trigger.hProcess, 5000);
         if (!exited) TerminateProcess(trigger.hProcess, 1);
         CloseHandle(trigger.hProcess);
+        output.reset();
+        std::ifstream file(reportFile, std::ios::binary);
+        const std::string printed{std::istreambuf_iterator<char>(file), {}};
         DWORD after = 0;
         if (const HWND resident = findResident()) GetWindowThreadProcessId(resident, &after);
-        passed = exited && after == pid && WaitForSingleObject(worker.get(), 0) == WAIT_TIMEOUT;
+        passed = exited && after == pid && WaitForSingleObject(worker.get(), 0) == WAIT_TIMEOUT &&
+            printed.starts_with(std::string("System.Photo.DateTaken ") + todayLabel +
+                ": 1 matching photo(s)\r\n") &&
+            printed.find(photo.string() + "\r\n") != std::string::npos &&
+            printed.find(older.string()) == std::string::npos;
     }
 
     passed = PostMessageW(window, WM_CLOSE, 0, 0) && passed;
@@ -247,10 +260,10 @@ int main() {
         passed = TestRefreshNames();
     } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--refresh-hit") {
         passed = TestRefreshHit();
-    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--resident") {
-        passed = TestResident(argv[2], folder);
-    } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--list") {
-        passed = TestList(argv[2], argv[3], folder);
+    } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--resident") {
+        passed = TestResident(argv[2], folder, argv[3]);
+    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--removed-list") {
+        passed = TestRemovedList(argv[2], folder);
     } else if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         if (argv && count == 3 && std::wstring_view(argv[1]) == L"--date-taken") {
             passed = TestDateTaken(argv[2], folder);
