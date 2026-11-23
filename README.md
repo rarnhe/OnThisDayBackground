@@ -1,6 +1,6 @@
 # OnThisDayBackground
 
-首次启动扫描往年同一天拍摄的照片，并在后台缓存路径。再次启动或选择桌面右键菜单的「刷新」时，通知同一个后台实例换下一张 Windows 原生壁纸。
+首次启动扫描具有拍摄日期的全部照片，并在后台缓存路径和月日。再次启动或选择桌面右键菜单的「刷新」时，通知同一个后台实例换下一张 Windows 原生壁纸。
 
 ## 使用
 
@@ -10,18 +10,14 @@
 .\OnThisDayBackground.exe "D:\Photos\FolderA"
 ```
 
-- 程序递归读取 `System.Photo.DateTaken`，按本地时间比较月日，再按完整路径排序。缺少拍摄日期的照片会跳过。
-- 首次启动只准备候选列表，并在 CMD 或 PowerShell 打印数量和完整路径。随后每次再次运行，或在桌面空白处右键选择「刷新」，都会轮换一张，到末尾后回到第一张。没有匹配项时后台继续等待。
-- 启动器打印完路径后退出，后台实例独立于 CMD 或 PowerShell。后续触发沿用首次扫描的路径。
+- 程序递归读取 `System.Photo.DateTaken`，将所有具有拍摄日期的图片按完整路径排序，建立内存索引 A（路径 + 月日）。缺少拍摄日期的照片会跳过。
+- 首次启动在 CMD 或 PowerShell 输出索引 A 中每张图片的月日与完整路径，然后启动器退出；此输出仅作独立展示，不参与按日筛选和轮换。随后每次再次运行，或在桌面空白处右键选择「刷新」，才按当时的本地月日从 A 创建或复用日期缓存 B，依次轮换当天照片，到末尾后回到第一张。跨天无需重启，没有匹配项时后台继续等待。
+- 启动器打印完路径后退出，后台实例独立于 CMD 或 PowerShell。索引 A 只在首次启动时建立；B 以月日为键，缓存对应照片路径与各自的轮换位置，后续触发不重新扫描。
 - 使用一个虚拟桌面时，通过 `IDesktopWallpaper` 指定主显示器。扩展显示模式下，副屏继续使用其原有壁纸。
 - 使用多个虚拟桌面时，核对 Explorer 当前桌面的 GUID，然后用该 GUID 定位并更新原生壁纸。程序会报告目标 GUID，并读回目标和其他桌面的壁纸路径，检查 Explorer 是否只更新了目标。当前虚拟桌面的多个显示器由 Windows 决定如何显示同一壁纸。
 - 单独设置当前虚拟桌面使用 Explorer 的内部接口。Windows 11 构建 22000、22621 和 22631 使用各自的接口布局。构建 26100 起（包括 26300 和 28000）尝试使用现代布局，并先验证 Explorer 是否提供相应接口、能否枚举桌面并读取当前桌面的 GUID。如果 Explorer 拒绝调用，错误会列出 Windows 构建号、失败步骤和 HRESULT。接口参考 [VirtualDesktop](https://github.com/MScholtes/VirtualDesktop) 和 [pyvda](https://github.com/mirober/pyvda)。
 
-使用 `--list` 可以独立扫描并打印候选数量和路径，供检查所指定的目录。
-
-```powershell
-Start-Process -FilePath .\OnThisDayBackground.exe -ArgumentList '--list "D:\Photos\FolderA"' -NoNewWindow -Wait
-```
+已删除 `--list` 参数。直接执行上面的带目录命令即可打印月日及图片路径；后台仍按 A/B 结构独立运行。
 
 ## 构建与验证
 
