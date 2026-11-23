@@ -42,6 +42,33 @@ int main() {
             if (photo.stem() == "conflict-11-22") return MonthDay{11, 22};
             return std::nullopt;
         };
+        // Combining Pictures and an additional folder includes both, but shared
+        // subtrees must not be re-read or appear twice in the daily B cache.
+        const auto extra = fs::temp_directory_path() /
+            ("on-this-day-extra-" + std::to_string(stamp));
+        fs::create_directories(extra);
+        std::ofstream(extra / "other-day.jpg").put('x');
+        int multiReads = 0;
+        const auto multiReader = [&](const fs::path& photo) -> std::optional<MonthDay> {
+            ++multiReads;
+            if (photo.filename() == "other-day.jpg") return MonthDay{11, 23};
+            return fullReader(photo);
+        };
+        const auto combined = ScanDatedPhotos(
+            std::vector<fs::path>{folder, folder / "a", folder, extra}, multiReader);
+        Check(combined.size() == 4, "combined roots must include extras without duplicates");
+        Check(multiReads == 6, "overlapping folders must read metadata only once per file");
+        Check(std::ranges::any_of(combined, [&](const DatedPhoto& item) {
+            return item.path == extra / "other-day.jpg";
+        }), "second root is indexed");
+        DailyPhotoCache combinedDaily;
+        combinedDaily.Reset(combined);
+        auto& extraDay = combinedDaily.ForDay({11, 23});
+        std::vector<fs::path> extraSeen;
+        const auto capture = [&](const fs::path& photo) { extraSeen.push_back(photo); return true; };
+        Check(extraDay.Advance(capture) && extraDay.Advance(capture) &&
+            extraSeen[0] != extraSeen[1], "different roots share one deduplicated rotation");
+        fs::remove_all(extra);
         DailyPhotoCache daily;
         const auto indexed = ScanDatedPhotos(folder, fullReader);
         Check(indexed.size() == 3, "A must index all dated photos, including other days");
