@@ -34,6 +34,40 @@ int main() {
         Check(ScanPhotos(folder, {11, 22}, readDate) == expected,
             "recursive scan, sort, image filter or capture-date-only matching");
         Check(ScanPhotos(folder, {12, 1}, readDate).empty(), "no matches");
+        int reads = 0;
+        const auto fullReader = [&](const fs::path& photo) -> std::optional<MonthDay> {
+            ++reads;
+            if (photo.stem() == "metadata") return MonthDay{11, 22};
+            if (photo.stem() == "z") return MonthDay{11, 23};
+            if (photo.stem() == "conflict-11-22") return MonthDay{11, 22};
+            return std::nullopt;
+        };
+        DailyPhotoCache daily;
+        const auto indexed = ScanDatedPhotos(folder, fullReader);
+        Check(indexed.size() == 3, "A must index all dated photos, including other days");
+        Check(indexed[0].path == folder / "a/nested/metadata.png", "A path order");
+        Check(indexed[0].date == MonthDay{11, 22}, "A keeps month/day");
+        daily.Reset(indexed);
+        Check(daily.IndexedCount() == 3 && daily.DayCacheCount() == 0, "B is lazy");
+        const auto afterScanReads = reads;
+        auto& firstDay = daily.ForDay({11, 22});
+        Check(daily.DayCacheCount() == 1, "create first B");
+        std::vector<fs::path> daysShown;
+        const auto record = [&](const fs::path& path) { daysShown.push_back(path); return true; };
+        Check(firstDay.Advance(record) && firstDay.Advance(record), "rotate first date");
+        Check(daysShown == std::vector<fs::path>{folder / "a/nested/metadata.png",
+            folder / "conflict-11-22.jpg"}, "first date matches in sorted order");
+        auto& tomorrow = daily.ForDay({11, 23});
+        Check(daily.DayCacheCount() == 2 && tomorrow.Advance(record) &&
+            daysShown.back() == folder / "z.JPG", "cross-day B created from A");
+        Check(&daily.ForDay({11, 22}) == &firstDay, "same B object reused");
+        Check(firstDay.Advance(record) &&
+            daysShown.back() == folder / "a/nested/metadata.png", "B keeps rotation across other day");
+        Check(reads == afterScanReads, "refresh must not reread disk metadata");
+        Check(daily.ForDay({12, 1}).Empty() && daily.DayCacheCount() == 3,
+            "empty B is cached too");
+        daily.Reset(indexed);
+        Check(daily.DayCacheCount() == 0 && daily.IndexedCount() == 3, "new scan invalidates Bs");
         PhotoRotation rotation;
         rotation.Reset(expected);
         std::vector<fs::path> shown;
