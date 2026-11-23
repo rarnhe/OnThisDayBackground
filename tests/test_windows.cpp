@@ -119,12 +119,19 @@ bool TestCommandLineIndex(const fs::path& app, const fs::path& fixture, const fs
 
     const HWND resident = FindWindowExW(HWND_MESSAGE, nullptr,
         L"OnThisDayBackground.Resident", nullptr);
-    if (!resident) return false;
+    if (!resident) {
+        std::cerr << "index diagnostic: no resident; exited=" << exited
+            << " printed=[" << printed << "] expected=[" << paths << "]\\n";
+        return false;
+    }
     DWORD pid = 0;
     GetWindowThreadProcessId(resident, &pid);
     std::unique_ptr<void, decltype(&CloseHandle)> worker(
         pid ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid) : nullptr, &CloseHandle);
-    if (!worker) return false;
+    if (!worker) {
+        std::cerr << "index diagnostic: resident without accessible process; pid=" << pid << "\\n";
+        return false;
+    }
     PostMessageW(resident, WM_CLOSE, 0, 0);
     if (!ExitedSuccessfully(worker.get(), 5000)) {
         TerminateProcess(worker.get(), 1);
