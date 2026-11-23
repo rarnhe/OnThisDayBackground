@@ -24,6 +24,8 @@ struct DatedPhoto {
     MonthDay date;
 };
 
+std::vector<DatedPhoto> ScanDatedPhotos(const std::vector<std::filesystem::path>& folders,
+    const PhotoDateReader& readDate);
 std::vector<DatedPhoto> ScanDatedPhotos(const std::filesystem::path& folder,
     const PhotoDateReader& readDate);
 
