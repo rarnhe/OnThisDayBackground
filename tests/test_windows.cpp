@@ -130,8 +130,15 @@ bool TestCommandLineIndex(const fs::path& app, const fs::path& fixture, const fs
         TerminateProcess(worker.get(), 1);
         return false;
     }
-    return correct && !FindWindowExW(HWND_MESSAGE, nullptr,
+    const bool gone = !FindWindowExW(HWND_MESSAGE, nullptr,
         L"OnThisDayBackground.Resident", nullptr);
+    if (!correct || !gone) {
+        std::cerr << "index output diagnostic: exited=" << exited << " gone=" << gone
+            << " bytes=" << printed.size() << "\\n"
+            << "printed: [" << printed << "]\\n"
+            << "expected suffix: [" << paths << "]\\n";
+    }
+    return correct && gone;
 }
 
 bool TestRemovedList(const fs::path& app, const fs::path& folder) {
