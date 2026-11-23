@@ -245,11 +245,11 @@ bool WriteOutput(HANDLE output, const std::wstring& text) {
 
 bool PrintIndex(HANDLE output, const std::vector<DatedPhoto>& photos) {
     if (!WriteOutput(output, L"System.Photo.DateTaken: " + std::to_wstring(photos.size()) +
-            L" indexed photo(s)\\r\\n")) return false;
+            L" indexed photo(s)\r\n")) return false;
     for (const auto& photo : photos) {
         wchar_t day[16]{};
         swprintf_s(day, L"%02u-%02u", photo.date.month, photo.date.day);
-        if (!WriteOutput(output, std::wstring(day) + L" " + photo.path.native() + L"\\r\\n"))
+        if (!WriteOutput(output, std::wstring(day) + L" " + photo.path.native() + L"\r\n"))
             return false;
     }
     return true;
