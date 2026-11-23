@@ -78,6 +78,58 @@ std::vector<fs::path> ScanPhotos(const fs::path& folder, MonthDay date,
     return matches;
 }
 
+std::vector<DatedPhoto> ScanDatedPhotos(const fs::path& folder,
+    const PhotoDateReader& readDate) {
+    std::vector<DatedPhoto> all;
+    std::vector<fs::path> directories{folder};
+    while (!directories.empty()) {
+        auto directory = std::move(directories.back());
+        directories.pop_back();
+        std::error_code error;
+        fs::directory_iterator entry(directory, fs::directory_options::skip_permission_denied, error);
+        const fs::directory_iterator end;
+        for (; !error && entry != end; entry.increment(error)) {
+            std::error_code statusError;
+            const auto status = entry->symlink_status(statusError);
+            if (fs::is_directory(status)) {
+#ifdef _WIN32
+                const DWORD attributes = GetFileAttributesW(entry->path().c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                    directories.push_back(entry->path());
+#else
+                directories.push_back(entry->path());
+#endif
+            } else if (fs::is_regular_file(status) && IsImageExtension(entry->path())) {
+                if (const auto date = readDate(entry->path())) {
+                    if (date->month >= 1 && date->month <= 12 && date->day >= 1 && date->day <= 31)
+                        all.push_back({entry->path(), *date});
+                }
+            }
+        }
+    }
+    std::ranges::sort(all, {}, &DatedPhoto::path);
+    return all;
+}
+
+void DailyPhotoCache::Reset(std::vector<DatedPhoto> indexed) {
+    indexed_ = std::move(indexed);
+    byDay_.clear();
+}
+
+PhotoRotation& DailyPhotoCache::ForDay(MonthDay date) {
+    const unsigned key = date.month * 100 + date.day;
+    if (auto it = byDay_.find(key); it != byDay_.end()) return it->second;
+    std::vector<fs::path> matches;
+    for (const auto& photo : indexed_) {
+        if (photo.date == date) matches.push_back(photo.path);
+    }
+    return byDay_.try_emplace(key, PhotoRotation{}).first->second = [&] {
+        PhotoRotation rotation;
+        rotation.Reset(std::move(matches));
+        return rotation;
+    }();
+}
+
 void PhotoRotation::Reset(std::vector<fs::path> photos) {
     photos_ = std::move(photos);
     next_ = 0;
@@ -189,6 +241,18 @@ bool WriteOutput(HANDLE output, const std::wstring& text) {
             utf8.data(), utf8Size, nullptr, nullptr)) return false;
     return WriteFile(output, utf8.data(), static_cast<DWORD>(utf8Size), &written, nullptr) &&
         written == static_cast<DWORD>(utf8Size);
+}
+
+bool PrintIndex(HANDLE output, const std::vector<DatedPhoto>& photos) {
+    if (!WriteOutput(output, L"System.Photo.DateTaken: " + std::to_wstring(photos.size()) +
+            L" indexed photo(s)\\r\\n")) return false;
+    for (const auto& photo : photos) {
+        wchar_t day[16]{};
+        swprintf_s(day, L"%02u-%02u", photo.date.month, photo.date.day);
+        if (!WriteOutput(output, std::wstring(day) + L" " + photo.path.native() + L"\\r\\n"))
+            return false;
+    }
+    return true;
 }
 
 bool PrintMatches(HANDLE output, MonthDay date, const std::vector<fs::path>& photos) {
@@ -900,7 +964,7 @@ HWND FindResident() {
 }
 
 struct Resident {
-    PhotoRotation rotation;
+    DailyPhotoCache photos;
     std::size_t pending = 0;
     bool busy = true;
     bool stopping = false;
@@ -913,7 +977,7 @@ void ProcessRequests(HWND window, Resident& state) {
     while (state.pending && !state.stopping) {
         --state.pending;
         try {
-            ApplyNextWallpaper(state.rotation);
+            ApplyNextWallpaper(state.photos.ForDay(Today()));
         } catch (const std::exception&) {
             ReportFailure(nullptr, L"Could not apply a photo from the cached list.", false);
         }
@@ -997,10 +1061,9 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
         ReportFailure(nullptr, L"Could not start the background message window.", false);
     } else {
         try {
-            const auto date = Today();
-            auto photos = ScanPhotos(folder, date, ReadDateTaken);
-            if (report) PrintMatches(report.get(), date, photos);
-            state.rotation.Reset(std::move(photos));
+            auto photos = ScanDatedPhotos(folder, ReadDateTaken);
+            if (report) PrintIndex(report.get(), photos);
+            state.photos.Reset(std::move(photos));
 
             const std::unique_ptr<void, decltype(&CloseHandle)> stop(
                 CreateEventW(nullptr, TRUE, FALSE, nullptr), &CloseHandle);
