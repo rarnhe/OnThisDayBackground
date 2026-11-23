@@ -255,17 +255,6 @@ bool PrintIndex(HANDLE output, const std::vector<DatedPhoto>& photos) {
     return true;
 }
 
-bool PrintMatches(HANDLE output, MonthDay date, const std::vector<fs::path>& photos) {
-    wchar_t day[16]{};
-    swprintf_s(day, L"%02u-%02u", date.month, date.day);
-    if (!WriteOutput(output, L"System.Photo.DateTaken " + std::wstring(day) + L": " +
-            std::to_wstring(photos.size()) + L" matching photo(s)\r\n")) return false;
-    for (const auto& photo : photos) {
-        if (!WriteOutput(output, photo.native() + L"\r\n")) return false;
-    }
-    return true;
-}
-
 fs::path ResolveFolder(const wchar_t* argument) {
     if (!argument) {
         PWSTR pictures = nullptr;
@@ -1188,20 +1177,6 @@ int StartResident(const fs::path& folder, HANDLE output) {
     return 0;
 }
 
-int ListPhotos(const fs::path& folder, HANDLE output) {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
-        return ReportFailure(output, L"Could not initialize the Windows shell interfaces.", true);
-    }
-    int result = 1;
-    try {
-        const auto date = Today();
-        result = PrintMatches(output, date, ScanPhotos(folder, date, ReadDateTaken)) ? 0 : 1;
-    } catch (const std::exception&) {
-        result = ReportFailure(output, L"Could not scan the requested photo folder.", true);
-    }
-    CoUninitialize();
-    return result;
-}
 } // namespace
 
 #ifdef _MSC_VER
@@ -1223,21 +1198,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         return RunResident(instance, argv.get()[2], report);
     }
 
-    const bool list = option == L"--list";
-    if (!list && argc <= 2) {
+    const HANDLE output = OpenCommandLineOutput();
+    if (option == L"--list") {
+        return ReportFailure(output, L"--list has been removed. Usage: OnThisDayBackground.exe [photo folder].", true);
+    }
+    if (argc <= 2) {
         if (const HWND resident = FindResident()) {
             return PostMessageW(resident, kNextWallpaper, 0, 0) ? 0 : 1;
         }
     }
 
-    const HANDLE output = OpenCommandLineOutput();
-    const int folderIndex = list ? 2 : 1;
-    const auto folder = argc <= folderIndex + 1 ?
-        ResolveFolder(argc > folderIndex ? argv.get()[folderIndex] : nullptr) : fs::path{};
+    const auto folder = argc <= 2 ?
+        ResolveFolder(argc == 2 ? argv.get()[1] : nullptr) : fs::path{};
     if (folder.empty()) {
-        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [--list] [photo folder].", list);
+        return ReportFailure(output, L"Usage: OnThisDayBackground.exe [photo folder].", true);
     }
-    return list ? ListPhotos(folder, output) : StartResident(folder, output);
+    return StartResident(folder, output);
 }
 
 #endif // _WIN32
