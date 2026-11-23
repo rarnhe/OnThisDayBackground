@@ -1125,6 +1125,19 @@ void PrintResidentReport(HANDLE pipe, HANDLE output) {
     }
 }
 
+bool PrintIndependentIndex(const fs::path& folder, HANDLE output) {
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initialized)) return false;
+    bool printed = false;
+    try {
+        printed = PrintIndex(output, ScanDatedPhotos(folder, ReadDateTaken));
+    } catch (const std::exception&) {
+        printed = false;
+    }
+    CoUninitialize();
+    return printed;
+}
+
 int StartResident(const fs::path& folder, HANDLE output) {
     std::wstring executable(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
@@ -1204,6 +1217,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
     if (argc <= 2) {
         if (const HWND resident = FindResident()) {
+            // An explicit folder argument prints a fresh, independent view.
+            // It must not reset the resident's A index or any B rotation cache.
+            if (argc == 2) {
+                const auto displayFolder = ResolveFolder(argv.get()[1]);
+                if (!displayFolder.empty() && !PrintIndependentIndex(displayFolder, output)) {
+                    return ReportFailure(output, L"Could not print the requested photo index.", true);
+                }
+            }
             return PostMessageW(resident, kNextWallpaper, 0, 0) ? 0 : 1;
         }
     }
