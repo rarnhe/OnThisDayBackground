@@ -135,7 +135,7 @@ bool TestResident(const fs::path& app, const fs::path& folder, const fs::path& f
     passed = passed && !PeekNamedPipe(reader.get(), nullptr, 0, nullptr, nullptr, nullptr) &&
         GetLastError() == ERROR_BROKEN_PIPE && report.starts_with("System.Photo.DateTaken: ") &&
         report.find("1 indexed photo(s)\r\n") != std::string::npos &&
-        report.find("10-07 " + photo.u8string()) != std::string::npos;
+        report.find("10-07 indexed-photo.jpg") != std::string::npos;
 
     HWND window = findResident();
     DWORD pid = 0;
