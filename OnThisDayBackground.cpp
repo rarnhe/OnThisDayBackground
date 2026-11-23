@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cwctype>
+#include <set>
 #include <utility>
 
 #ifdef _WIN32
@@ -78,10 +79,21 @@ std::vector<fs::path> ScanPhotos(const fs::path& folder, MonthDay date,
     return matches;
 }
 
-std::vector<DatedPhoto> ScanDatedPhotos(const fs::path& folder,
+std::vector<DatedPhoto> ScanDatedPhotos(const std::vector<fs::path>& folders,
     const PhotoDateReader& readDate) {
     std::vector<DatedPhoto> all;
-    std::vector<fs::path> directories{folder};
+    std::vector<fs::path> directories(folders.begin(), folders.end());
+    // Roots can be identical or nested; read each image's Property Store once.
+    std::set<std::wstring> visited;
+    const auto normalizedKey = [](const fs::path& file) {
+        std::wstring key = file.lexically_normal().wstring();
+#ifdef _WIN32
+        std::ranges::transform(key, key.begin(), [](wchar_t c) {
+            return static_cast<wchar_t>(std::towlower(c));
+        });
+#endif
+        return key;
+    };
     while (!directories.empty()) {
         auto directory = std::move(directories.back());
         directories.pop_back();
@@ -100,6 +112,7 @@ std::vector<DatedPhoto> ScanDatedPhotos(const fs::path& folder,
                 directories.push_back(entry->path());
 #endif
             } else if (fs::is_regular_file(status) && IsImageExtension(entry->path())) {
+                if (!visited.insert(normalizedKey(entry->path())).second) continue;
                 if (const auto date = readDate(entry->path())) {
                     if (date->month >= 1 && date->month <= 12 && date->day >= 1 && date->day <= 31)
                         all.push_back({entry->path(), *date});
@@ -109,6 +122,11 @@ std::vector<DatedPhoto> ScanDatedPhotos(const fs::path& folder,
     }
     std::ranges::sort(all, {}, &DatedPhoto::path);
     return all;
+}
+
+std::vector<DatedPhoto> ScanDatedPhotos(const fs::path& folder,
+    const PhotoDateReader& readDate) {
+    return ScanDatedPhotos(std::vector<fs::path>{folder}, readDate);
 }
 
 void DailyPhotoCache::Reset(std::vector<DatedPhoto> indexed) {
@@ -272,6 +290,15 @@ fs::path ResolveFolder(const wchar_t* argument) {
     const auto folder = fs::absolute(argument, error);
     if (!error && fs::is_directory(folder, error)) return folder.lexically_normal();
     return {};
+}
+
+std::vector<fs::path> ScanFolders(const fs::path& extra) {
+    std::vector<fs::path> roots;
+    // Always include the user's Windows Pictures known folder.
+    if (const auto pictures = ResolveFolder(nullptr); !pictures.empty())
+        roots.push_back(pictures);
+    if (!extra.empty()) roots.push_back(extra);
+    return roots;
 }
 
 constexpr wchar_t kDesktopKey[] =
@@ -1048,7 +1075,7 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
         ReportFailure(nullptr, L"Could not start the background message window.", false);
     } else {
         try {
-            auto photos = ScanDatedPhotos(folder, ReadDateTaken);
+            auto photos = ScanDatedPhotos(ScanFolders(folder), ReadDateTaken);
             if (report) PrintIndex(report.get(), Today(), photos);
             state.photos.Reset(std::move(photos));
 
@@ -1128,7 +1155,7 @@ bool PrintIndependentIndex(const fs::path& folder, HANDLE output) {
     if (FAILED(initialized)) return false;
     bool printed = false;
     try {
-        printed = PrintIndex(output, Today(), ScanDatedPhotos(folder, ReadDateTaken));
+        printed = PrintIndex(output, Today(), ScanDatedPhotos(ScanFolders(folder), ReadDateTaken));
     } catch (const std::exception&) {
         printed = false;
     }
@@ -1225,9 +1252,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         return 0;
     }
 
-    const auto folder = argc <= 2 ?
-        ResolveFolder(argc == 2 ? argv.get()[1] : nullptr) : fs::path{};
-    if (folder.empty()) {
+    const auto folder = argc <= 2 && argc == 2 ?
+        ResolveFolder(argv.get()[1]) : fs::path{};
+    if (argc > 2 || (argc == 2 && folder.empty()) || ScanFolders(folder).empty()) {
         return ReportFailure(output, L"Usage: OnThisDayBackground.exe [photo folder].", true);
     }
     return StartResident(folder, output);
