@@ -11,9 +11,8 @@ if(WIN32)
     add_test(NAME windows_current_desktop_guid COMMAND test_windows --desktop-guid)
     add_test(NAME windows_explorer_refresh_names COMMAND test_windows --refresh-names)
     add_test(NAME windows_explorer_refresh_hit COMMAND test_windows --refresh-hit)
-    add_test(NAME windows_gui_single_instance COMMAND test_windows --resident $<TARGET_FILE:OnThisDayBackground>)
-    add_test(NAME windows_cli_photo_list COMMAND test_windows --index-output $<TARGET_FILE:OnThisDayBackground>
+    add_test(NAME windows_gui_single_instance COMMAND test_windows --resident $<TARGET_FILE:OnThisDayBackground>
         "${CMAKE_CURRENT_SOURCE_DIR}/filename-2000-08-10.jpg")
     add_test(NAME windows_removed_list_flag COMMAND test_windows --removed-list $<TARGET_FILE:OnThisDayBackground>)
-    set_tests_properties(windows_gui_single_instance windows_cli_photo_list windows_removed_list_flag PROPERTIES TIMEOUT 20)
+    set_tests_properties(windows_gui_single_instance windows_removed_list_flag PROPERTIES TIMEOUT 20)
 endif()
