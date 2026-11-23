@@ -155,7 +155,7 @@ bool TestResident(const fs::path& app, const fs::path& folder) {
     }
     passed = passed && !PeekNamedPipe(reader.get(), nullptr, 0, nullptr, nullptr, nullptr) &&
         GetLastError() == ERROR_BROKEN_PIPE && report.starts_with("System.Photo.DateTaken: ") &&
-        report.ends_with("0 matching photo(s)\r\n");
+        report.ends_with("0 indexed photo(s)\r\n");
 
     HWND window = findResident();
     DWORD pid = 0;
