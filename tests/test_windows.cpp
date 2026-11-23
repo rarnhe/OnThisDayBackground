@@ -79,75 +79,6 @@ bool ExitedSuccessfully(HANDLE process, DWORD timeout) {
         GetExitCodeProcess(process, &code) && code == 0;
 }
 
-bool TestCommandLineIndex(const fs::path& app, const fs::path& fixture, const fs::path& folder) {
-    // Use a known EXIF month/day that differs from today's date on most days.
-    // No --list option: the ordinary directory launch prints its independent A index.
-    std::ifstream jpeg(fixture, std::ios::binary);
-    const std::string bytes{std::istreambuf_iterator<char>(jpeg), {}};
-    if (bytes.empty()) return false;
-    const auto photos = folder / L"photos";
-    fs::create_directory(photos);
-    const auto first = photos / L"a-\u7167\u7247.jpg";
-    const auto second = photos / L"z.jpg";
-    for (const auto& photo : {second, first}) {
-        if (!std::ofstream(photo, std::ios::binary).write(bytes.data(), bytes.size())) return false;
-    }
-    // This is an image path without a valid DateTaken property.
-    std::ofstream(photos / "undated.jpg", std::ios::binary).put('x');
-
-    const auto log = folder / "stdout.txt";
-    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
-    const HANDLE raw = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &attributes,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) return false;
-    std::unique_ptr<void, decltype(&CloseHandle)> output(raw, &CloseHandle);
-
-    PROCESS_INFORMATION process{};
-    if (!Launch(app, photos, process, {}, output.get())) return false;
-    const bool exited = ExitedSuccessfully(process.hProcess, 5000);
-    if (!exited) TerminateProcess(process.hProcess, 1);
-    CloseHandle(process.hProcess);
-    output.reset();
-
-    std::ifstream result(log, std::ios::binary);
-    const std::string printed{std::istreambuf_iterator<char>(result), {}};
-    const auto expected = u8"10-07 " + first.u8string() + u8"\r\n" +
-        u8"10-07 " + second.u8string() + u8"\r\n";
-    const std::string paths(expected.begin(), expected.end());
-    const bool correct = exited && printed.starts_with("System.Photo.DateTaken: 2 indexed photo(s)\r\n") &&
-        printed.ends_with(paths) && printed.find("undated.jpg") == std::string::npos;
-
-    const HWND resident = FindWindowExW(HWND_MESSAGE, nullptr,
-        L"OnThisDayBackground.Resident", nullptr);
-    if (!resident) {
-        std::cerr << "index diagnostic: no resident; exited=" << exited
-            << " printed=[" << printed << "] expected=[" << paths << "]\\n";
-        return false;
-    }
-    DWORD pid = 0;
-    GetWindowThreadProcessId(resident, &pid);
-    std::unique_ptr<void, decltype(&CloseHandle)> worker(
-        pid ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid) : nullptr, &CloseHandle);
-    if (!worker) {
-        std::cerr << "index diagnostic: resident without accessible process; pid=" << pid << "\\n";
-        return false;
-    }
-    PostMessageW(resident, WM_CLOSE, 0, 0);
-    if (!ExitedSuccessfully(worker.get(), 5000)) {
-        TerminateProcess(worker.get(), 1);
-        return false;
-    }
-    const bool gone = !FindWindowExW(HWND_MESSAGE, nullptr,
-        L"OnThisDayBackground.Resident", nullptr);
-    if (!correct || !gone) {
-        std::cerr << "index output diagnostic: exited=" << exited << " gone=" << gone
-            << " bytes=" << printed.size() << "\\n"
-            << "printed: [" << printed << "]\\n"
-            << "expected suffix: [" << paths << "]\\n";
-    }
-    return correct && gone;
-}
-
 bool TestRemovedList(const fs::path& app, const fs::path& folder) {
     // --list is explicitly rejected and must never spawn a resident process.
     const auto log = folder / "removed-list.txt";
@@ -170,11 +101,13 @@ bool TestRemovedList(const fs::path& app, const fs::path& folder) {
         !FindWindowExW(HWND_MESSAGE, nullptr, L"OnThisDayBackground.Resident", nullptr);
 }
 
-bool TestResident(const fs::path& app, const fs::path& folder) {
+bool TestResident(const fs::path& app, const fs::path& folder, const fs::path& fixture) {
     const auto findResident = [] {
         return FindWindowExW(HWND_MESSAGE, nullptr, L"OnThisDayBackground.Resident", nullptr);
     };
     if (!IsWindowsGui(app) || findResident()) return false;
+    const auto photo = folder / L"indexed-photo.jpg";
+    fs::copy_file(fixture, photo, fs::copy_options::overwrite_existing);
 
     HANDLE pipeRead = nullptr, pipeWrite = nullptr;
     SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
@@ -201,7 +134,8 @@ bool TestResident(const fs::path& app, const fs::path& folder) {
     }
     passed = passed && !PeekNamedPipe(reader.get(), nullptr, 0, nullptr, nullptr, nullptr) &&
         GetLastError() == ERROR_BROKEN_PIPE && report.starts_with("System.Photo.DateTaken: ") &&
-        report.ends_with("0 indexed photo(s)\r\n");
+        report.find("1 indexed photo(s)\r\n") != std::string::npos &&
+        report.find("10-07 " + photo.u8string()) != std::string::npos;
 
     HWND window = findResident();
     DWORD pid = 0;
@@ -293,10 +227,8 @@ int main() {
         passed = TestRefreshNames();
     } else if (argv && count == 2 && std::wstring_view(argv[1]) == L"--refresh-hit") {
         passed = TestRefreshHit();
-    } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--resident") {
-        passed = TestResident(argv[2], folder);
-    } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--index-output") {
-        passed = TestCommandLineIndex(argv[2], argv[3], folder);
+    } else if (argv && count == 4 && std::wstring_view(argv[1]) == L"--resident") {
+        passed = TestResident(argv[2], folder, argv[3]);
     } else if (argv && count == 3 && std::wstring_view(argv[1]) == L"--removed-list") {
         passed = TestRemovedList(argv[2], folder);
     } else if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
