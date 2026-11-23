@@ -243,14 +243,17 @@ bool WriteOutput(HANDLE output, const std::wstring& text) {
         written == static_cast<DWORD>(utf8Size);
 }
 
-bool PrintIndex(HANDLE output, const std::vector<DatedPhoto>& photos) {
-    if (!WriteOutput(output, L"System.Photo.DateTaken: " + std::to_wstring(photos.size()) +
-            L" indexed photo(s)\r\n")) return false;
+bool PrintIndex(HANDLE output, MonthDay today, const std::vector<DatedPhoto>& photos) {
+    std::vector<const DatedPhoto*> matches;
     for (const auto& photo : photos) {
-        wchar_t day[16]{};
-        swprintf_s(day, L"%02u-%02u", photo.date.month, photo.date.day);
-        if (!WriteOutput(output, std::wstring(day) + L" " + photo.path.native() + L"\r\n"))
-            return false;
+        if (photo.date == today) matches.push_back(&photo);
+    }
+    wchar_t day[16]{};
+    swprintf_s(day, L"%02u-%02u", today.month, today.day);
+    if (!WriteOutput(output, L"System.Photo.DateTaken " + std::wstring(day) + L": " +
+            std::to_wstring(matches.size()) + L" matching photo(s)\r\n")) return false;
+    for (const auto* photo : matches) {
+        if (!WriteOutput(output, photo->path.native() + L"\r\n")) return false;
     }
     return true;
 }
@@ -674,7 +677,6 @@ int ApplyNextWallpaper(PhotoRotation& rotation) {
 }
 constexpr wchar_t kResidentClass[] = L"OnThisDayBackground.Resident";
 constexpr wchar_t kResidentMutex[] = L"Local\\OnThisDayBackground.Resident";
-constexpr UINT kNextWallpaper = WM_APP + 1;
 constexpr UINT kDesktopRefreshInvoked = WM_APP + 2;
 
 std::wstring LocalizedRefreshLabel() {
@@ -990,9 +992,7 @@ LRESULT CALLBACK ResidentProc(HWND window, UINT message, WPARAM wParam, LPARAM l
                 GetTickCount64() - input.menuStarted > 30000) return 0;
             input.explorerPid = 0;
             input.hit.reset();
-            [[fallthrough]];
         }
-        case kNextWallpaper:
             ++state->pending;
             ProcessRequests(window, *state);
             return 0;
@@ -1022,9 +1022,7 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
             if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) {
                 return ReportFailure(nullptr, L"Could not reach the running background instance.", false);
             }
-            if (const HWND resident = FindResident()) {
-                if (PostMessageW(resident, kNextWallpaper, 0, 0)) return 0;
-            }
+            if (FindResident()) return 0;
             Sleep(25);
         }
     }
@@ -1051,7 +1049,7 @@ int RunResident(HINSTANCE instance, const fs::path& folder, HANDLE reportPipe) {
     } else {
         try {
             auto photos = ScanDatedPhotos(folder, ReadDateTaken);
-            if (report) PrintIndex(report.get(), photos);
+            if (report) PrintIndex(report.get(), Today(), photos);
             state.photos.Reset(std::move(photos));
 
             const std::unique_ptr<void, decltype(&CloseHandle)> stop(
@@ -1130,7 +1128,7 @@ bool PrintIndependentIndex(const fs::path& folder, HANDLE output) {
     if (FAILED(initialized)) return false;
     bool printed = false;
     try {
-        printed = PrintIndex(output, ScanDatedPhotos(folder, ReadDateTaken));
+        printed = PrintIndex(output, Today(), ScanDatedPhotos(folder, ReadDateTaken));
     } catch (const std::exception&) {
         printed = false;
     }
@@ -1215,18 +1213,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     if (option == L"--list") {
         return ReportFailure(output, L"--list has been removed. Usage: OnThisDayBackground.exe [photo folder].", true);
     }
-    if (argc <= 2) {
-        if (const HWND resident = FindResident()) {
-            // An explicit folder argument prints a fresh, independent view.
-            // It must not reset the resident's A index or any B rotation cache.
-            if (argc == 2) {
-                const auto displayFolder = ResolveFolder(argv.get()[1]);
-                if (!displayFolder.empty() && !PrintIndependentIndex(displayFolder, output)) {
-                    return ReportFailure(output, L"Could not print the requested photo index.", true);
-                }
+    if (argc <= 2 && FindResident()) {
+        // A directory argument is an independent query, not a rotation event.
+        // It must never modify the resident A/B caches or trigger wallpaper updates.
+        if (argc == 2) {
+            const auto displayFolder = ResolveFolder(argv.get()[1]);
+            if (displayFolder.empty() || !PrintIndependentIndex(displayFolder, output)) {
+                return ReportFailure(output, L"Could not print photos for the requested folder.", true);
             }
-            return PostMessageW(resident, kNextWallpaper, 0, 0) ? 0 : 1;
         }
+        return 0;
     }
 
     const auto folder = argc <= 2 ?
